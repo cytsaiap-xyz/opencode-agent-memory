@@ -27,11 +27,19 @@ export function searchMemory(index: MemoryIndex, opts: SearchOpts, now: Date = n
     limit: 30,
   })
   if (opts.domain) hits = hits.filter((h) => h.entry.domain.includes(opts.domain!))
-  const score = (h: SearchHit): number => {
+  // index.search() returns hits in bm25 order (best match first). Raw bm25 magnitudes are
+  // corpus-scale dependent (often ~1e-6 on small stores), so blending them additively with a
+  // confidence/recency term let those terms dominate relevance outright. Instead, rerank by
+  // bm25 *rank position* and let confidence/recency nudge within a bounded window: a hit can
+  // move at most ~1.7 rank positions, so relevance ordering still wins beyond adjacent hits.
+  const score = (h: SearchHit, i: number): number => {
     const recent = now.getTime() - new Date(h.entry.updated_at).getTime() <= RECENCY_WINDOW_MS
-    return h.score - 2 * h.entry.confidence + (recent ? -0.5 : 0)
+    return i - h.entry.confidence - (recent ? 0.75 : 0)
   }
-  hits.sort((a, b) => score(a) - score(b))
+  hits = hits
+    .map((h, i) => ({ h, s: score(h, i) }))
+    .sort((a, b) => a.s - b.s)
+    .map((x) => x.h)
   const top = hits.slice(0, limit)
   for (const h of top) index.recordAccess(h.entry.id)
   return top.map((h) => ({

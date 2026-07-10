@@ -51,6 +51,49 @@ test("searchMemory: confidence and recency boost the ranking", async () => {
   expect(hits[0]!.id).toBe("mem_fresh")
 })
 
+test("searchMemory: relevance stays primary — dense strong match beats diluted high-confidence match", async () => {
+  const { index } = await setup([
+    entry("mem_strong", {
+      confidence: 0.5,
+      updated_at: "2026-01-01T00:00:00.000Z", // stale
+      title: "parasitics note",
+      trigger: "after ECO",
+      lesson: "Parasitics parasitics parasitics matter a lot for timing sign-off during STA convergence checks.",
+    }),
+    entry("mem_b", {
+      confidence: 0.65,
+      updated_at: "2026-06-01T00:00:00.000Z",
+      title: "unrelated note about routing congestion",
+      trigger: "after floorplan change",
+      lesson:
+        "Routing congestion fix unrelated to parasitics topic here mentions it once only for filler " +
+        "purposes in this short note about congestion near the die edge macros.",
+    }),
+    entry("mem_c", {
+      confidence: 0.65,
+      updated_at: "2026-06-01T00:00:00.000Z",
+      title: "clock tree synthesis note",
+      trigger: "after CTS run",
+      lesson:
+        "Clock tree synthesis buffer sizing guidance completely unrelated except mentioning parasitics once " +
+        "here as filler text for this note about CTS buffers and skew targets.",
+    }),
+    entry("mem_weak", {
+      confidence: 0.95,
+      updated_at: "2026-07-09T00:00:00.000Z", // recent
+      title: "quarterly review meeting notes summary",
+      trigger: "weekly sync",
+      lesson:
+        "Team discussed roadmap priorities, staffing plans, budget allocation, vendor negotiations, office " +
+        "relocation timeline, holiday schedule, onboarding process improvements, and one attendee briefly " +
+        "mentioned parasitics in passing during an unrelated tangent about lab equipment calibration " +
+        "procedures and vendor support contracts renewal timeline for next fiscal year planning cycle.",
+    }),
+  ])
+  const hits = searchMemory(index, { query: "parasitics" }, NOW)
+  expect(hits[0]!.id).toBe("mem_strong")
+})
+
 test("searchMemory: domain filter, limit cap, access recording", async () => {
   const { index } = await setup([
     entry("mem_a", { domain: ["sta"] }),
