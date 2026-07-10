@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite"
-import { readFileSync, writeFileSync } from "node:fs"
-import { listEntryPaths, parseEntry, serializeEntry } from "./store"
+import { readFileSync } from "node:fs"
+import { listEntryPaths, parseEntry } from "./store"
 import type { MemoryEntry } from "./types"
 import { PIPELINE_VERSION } from "./types"
 
@@ -60,7 +60,6 @@ export class MemoryIndex {
   }
 
   upsertEntry(e: MemoryEntry, path: string): void {
-    writeFileSync(path, serializeEntry(e))
     this.db.run(`DELETE FROM memories_fts WHERE id = ?`, [e.id])
     this.db.run(
       `INSERT OR REPLACE INTO memories (id, project, type, status, confidence, volatile, path, updated_at)

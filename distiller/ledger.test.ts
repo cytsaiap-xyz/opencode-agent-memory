@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test"
-import { mkdtempSync } from "node:fs"
+import { mkdtempSync, readFileSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { MemoryIndex } from "./ledger"
-import { writeEntry } from "./store"
+import { parseEntry, writeEntry } from "./store"
 import type { MemoryEntry } from "./types"
 
 const tmp = () => mkdtempSync(join(tmpdir(), "amem-idx-"))
@@ -51,7 +51,9 @@ test("upsertEntry is an update, not a duplicate; removeEntry removes", async () 
   const e = entry("mem_1")
   const p = await writeEntry(join(dir, "store"), e)
   idx.upsertEntry(e, p)
-  idx.upsertEntry({ ...e, lesson: "Updated lesson about SPEF." }, p)
+  const updated = { ...e, lesson: "Updated lesson about SPEF." }
+  const updatedPath = await writeEntry(join(dir, "store"), updated)
+  idx.upsertEntry(updated, updatedPath)
   const hits = idx.search("SPEF")
   expect(hits.filter((h) => h.entry.id === "mem_1").length).toBe(1)
   expect(idx.getById("mem_1")!.entry.lesson).toBe("Updated lesson about SPEF.")
@@ -86,5 +88,21 @@ test("recordAccess bumps counters; stats aggregates; rebuildFrom restores index"
   expect(n).toBe(3)
   expect(idx.search("SPEF", {}).length).toBe(3)
   expect(idx.stats().sessions).toBe(1) // ledger survives rebuild
+  idx.close()
+})
+
+test("rebuildFrom does not modify markdown files", async () => {
+  const dir = tmp()
+  const store = join(dir, "store")
+  const idx = new MemoryIndex(join(dir, "index.db"))
+  const e = entry("mem_1")
+  const p = await writeEntry(store, e)
+  idx.upsertEntry(e, p)
+  const before = statSync(p).mtimeMs
+
+  await idx.rebuildFrom(store)
+
+  expect(statSync(p).mtimeMs).toBe(before)
+  expect(parseEntry(readFileSync(p, "utf8"))).toEqual(e)
   idx.close()
 })
