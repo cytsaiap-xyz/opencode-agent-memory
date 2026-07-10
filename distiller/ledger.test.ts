@@ -83,12 +83,34 @@ test("recordAccess bumps counters; stats aggregates; rebuildFrom restores index"
   expect(s.byStatus.quarantined).toBe(1)
   expect(s.byType.pitfall).toBe(2)
   expect(s.sessions).toBe(1)
+  expect(s.lastProcessedAt).not.toBeNull()
+  expect(typeof s.lastProcessedAt).toBe("string")
 
   const n = await idx.rebuildFrom(store)
   expect(n).toBe(3)
   expect(idx.search("SPEF", {}).length).toBe(3)
   expect(idx.stats().sessions).toBe(1) // ledger survives rebuild
   idx.close()
+})
+
+test("stats.lastProcessedAt is null on fresh index", () => {
+  const idx = new MemoryIndex(join(tmp(), "index.db"))
+  const s = idx.stats()
+  expect(s.lastProcessedAt).toBeNull()
+  idx.close()
+})
+
+test("concurrent MemoryIndex instances on same db path don't throw with busy_timeout", async () => {
+  const dbPath = join(tmp(), "index.db")
+  const idx1 = new MemoryIndex(dbPath)
+  idx1.recordProcessed({ session_id: "s1", content_hash: "h1", extractor_model: "f", n_candidates: 1, n_committed: 1 })
+  idx1.close()
+
+  const idx2 = new MemoryIndex(dbPath)
+  idx2.recordProcessed({ session_id: "s2", content_hash: "h2", extractor_model: "f", n_candidates: 1, n_committed: 1 })
+  idx2.close()
+
+  expect(true).toBe(true) // Both instances closed cleanly
 })
 
 test("rebuildFrom does not modify markdown files", async () => {

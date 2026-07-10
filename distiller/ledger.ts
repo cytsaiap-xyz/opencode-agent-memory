@@ -40,6 +40,7 @@ export class MemoryIndex {
   constructor(dbPath: string) {
     this.db = new Database(dbPath, { create: true })
     this.db.run("PRAGMA journal_mode = WAL")
+    this.db.run("PRAGMA busy_timeout = 5000")
     this.db.run(DDL)
   }
 
@@ -125,7 +126,7 @@ export class MemoryIndex {
     ])
   }
 
-  stats(): { byStatus: Record<string, number>; byType: Record<string, number>; sessions: number } {
+  stats(): { byStatus: Record<string, number>; byType: Record<string, number>; sessions: number; lastProcessedAt: string | null } {
     const byStatus: Record<string, number> = {}
     for (const r of this.db.query(`SELECT status, COUNT(*) AS n FROM memories GROUP BY status`).all() as Array<{ status: string; n: number }>)
       byStatus[r.status] = r.n
@@ -133,7 +134,8 @@ export class MemoryIndex {
     for (const r of this.db.query(`SELECT type, COUNT(*) AS n FROM memories GROUP BY type`).all() as Array<{ type: string; n: number }>)
       byType[r.type] = r.n
     const sessions = (this.db.query(`SELECT COUNT(*) AS n FROM processed_sessions`).get() as { n: number }).n
-    return { byStatus, byType, sessions }
+    const lastProcessedAt = (this.db.query("SELECT MAX(processed_at) AS m FROM processed_sessions").get() as { m: string | null }).m
+    return { byStatus, byType, sessions, lastProcessedAt }
   }
 
   accessStats(id: string): { access_count: number; last_accessed: string | null } | null {
