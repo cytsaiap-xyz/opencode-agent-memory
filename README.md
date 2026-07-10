@@ -11,11 +11,11 @@ Three components, one monorepo, fully on-prem (no external API calls):
 | Component | Kind | Job | Status |
 |---|---|---|---|
 | `collector/` | opencode plugin (TS) | on `session.idle`, export the session from `opencode.db` as a human-readable markdown transcript | **shipped** |
-| `distiller/` | scheduled batch CLI (TS+Bun) | filter + consolidate transcripts into structured memory entries via LLM | upcoming |
+| `distiller/` | scheduled batch CLI (TS+Bun) | filter + consolidate transcripts into structured memory entries via LLM | **shipped** |
 | `mcp-server/` | MCP server (TS+Bun) | query interface over the memory store | upcoming |
 
-This repo currently ships the **collector** only. `distiller/` and
-`mcp-server/` are placeholders for later phases (see
+This repo currently ships the **collector** and **distiller**. `mcp-server/`
+is a placeholder for the next phase (see
 `docs/superpowers/specs/2026-07-10-agent-memory-design.md`).
 
 ## Install
@@ -140,28 +140,200 @@ opencode's own DB path is derived from `XDG_DATA_HOME` (default
   (`new Database(dbPath, { readonly: true })`). It never writes to
   `opencode.db`.
 
+## Distiller
+
+The distiller turns idle transcripts under
+`${AGENT_MEMORY_HOME:-~/.agent-memory}/transcripts/` into structured,
+deduplicated memory entries under `store/`. Unlike the collector, it does not
+run per-session — it's a scheduled batch job (see Scheduling below).
+
+### Pipeline stages
+
+Each eligible transcript (one session = one unit of work) goes through:
+
+```
+INGEST → TRIAGE → EXTRACT → VALIDATE → RECONCILE → COMMIT → PUBLISH
+```
+
+1. **INGEST** — scan the transcript spool; skip a session if the ledger
+   already has a row for its `(session_id, content_hash, pipeline_version)`,
+   and skip any transcript that hasn't been idle for `AGENT_MEMORY_IDLE_HOURS`
+   yet.
+2. **TRIAGE** — a cheap, LLM-free gate: transcripts whose body is under 400
+   characters are skipped (a ledger row with 0 candidates is still recorded,
+   so they aren't rescanned every run) without ever calling the LLM.
+3. **EXTRACT** — one big-model call per transcript, strict JSON array output
+   against a 6-type taxonomy (`decision`, `root_cause`, `pitfall`, `know_how`,
+   `convention`, `workflow`); candidates scoring below
+   `AGENT_MEMORY_SALIENCE_MIN` are silently dropped.
+4. **VALIDATE** (deterministic, no LLM) — per-field schema, every evidence
+   `message_id` must match a real `{#msg_id}` anchor in the transcript
+   (a hallucinated anchor rejects the candidate), `lesson` ≤ 80 words, and a
+   secret/high-entropy-token scan — a hit sends the candidate to quarantine
+   instead of rejecting it.
+5. **RECONCILE** (Mem0-style) — FTS-query the top 5 similar `active` memories,
+   then an LLM call picks exactly one of `ADD` / `UPDATE` / `SUPERSEDE` /
+   `NOOP`. `SUPERSEDE` marks the old entry `status: superseded` and sets its
+   `superseded_by`; entries are never deleted.
+6. **COMMIT** — write/update the memory markdown file(s) and append a ledger
+   row recording candidate/committed counts.
+7. **PUBLISH** — regenerate `store/INDEX.md`, a human-readable catalog grouped
+   by project, sorted by type then confidence (descending). This only happens
+   at the end of `distill run` — `reindex`/`review`/`stats` don't touch it.
+
+### CLI usage
+
+```bash
+bun run distill run [--project <slug>]   # run the pipeline once
+bun run distill reindex                  # rebuild index.db from memories/ on disk
+bun run distill review                   # list quarantined entries needing human review
+bun run distill stats                    # print counts by status/type + sessions processed
+```
+
+`run` prints a one-line summary, e.g.:
+
+```
+distill done: 3 added, 1 updated, 0 superseded, 2 nooped, 1 quarantined, 0 rejected, 0 errors (scanned 12, eligible 8, already-done 5, triaged 1)
+```
+
+Exit codes: `0` success, `1` bad usage/config (unknown command, missing
+`--project` value, invalid env value), `2` one or more transcripts errored
+during a `run` (the rest of the batch still completes).
+
+### Configuration
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `AGENT_MEMORY_LLM` | *(unset)* | `vllm` selects the vLLM backend; anything else (or unset) falls back to `opencode-run`. |
+| `AGENT_MEMORY_VLLM_URL` | — | Base URL of an OpenAI-compatible `/chat/completions` endpoint. Required when `AGENT_MEMORY_LLM=vllm`. |
+| `AGENT_MEMORY_VLLM_MODEL` | — | Model name sent to the vLLM endpoint. Required when `AGENT_MEMORY_LLM=vllm`. |
+| `AGENT_MEMORY_VLLM_KEY` | *(none)* | Optional bearer token, sent as `Authorization: Bearer <key>` when set. |
+| `AGENT_MEMORY_IDLE_HOURS` | `6` | Minimum hours since a transcript's `time_end` before it becomes eligible. Must be `>= 0`. |
+| `AGENT_MEMORY_SALIENCE_MIN` | `6` | Minimum salience (0-10) an extracted candidate must score to survive; below this it's dropped, not rejected. Must be in `[0, 10]`. |
+
+`AGENT_MEMORY_HOME` (see the collector's Configuration table above) is shared
+— it also determines `store/` and `transcripts/` for the distiller.
+
+### Memory entry format
+
+One markdown file per memory, filename = id. Frontmatter is the machine layer
+(parsed into `index.db`); the body is the human-readable wiki layer:
+
+```markdown
+---
+id: mem_20260710_a3f9c1
+memory_class: semantic            # episodic | semantic | procedural
+type: root_cause                  # decision|root_cause|pitfall|know_how|convention|workflow
+title: "…"
+trigger: "when …"
+project: opencode-dynflow         # or "global"
+scope: project                    # project | global
+domain: [sta, eco-flow]
+volatile: false
+confidence: 0.55
+status: active                    # candidate | active | superseded | quarantined | archived
+superseded_by: null
+review: auto                      # auto | human_pending | human_approved
+evidence:
+  - { session: ses_…, anchors: [msg_…, msg_…], observed_at: ISO8601 }
+provenance:
+  extractor: "distiller v0.1 / <model>"
+  prompt_hash: sha256:…
+created_at: ISO8601
+updated_at: ISO8601
+---
+<lesson text, imperative/conditional, ≤ 80 words>
+
+## Notes
+<optional longer narrative added by UPDATE ops, append-only with dated bullets>
+```
+
+Confidence is deterministic, never LLM-rated:
+`0.5 + 0.15·(independent_sessions−1) + 0.2·human_approved − 0.25·contradicted`,
+clamped to `[0.1, 0.95]` and rounded to 2 decimals. The base is `0.5` rather
+than a more conservative `0.4` because every candidate has already passed the
+salience gate — a `0.4` base would put every brand-new, single-session memory
+below the MCP query default of `confidence >= 0.5`, making the store
+invisible on day one (this is a deliberate amendment over the initial spec
+draft — see `docs/superpowers/specs/2026-07-10-agent-memory-design.md` §6).
+
+### Store layout
+
+```
+${AGENT_MEMORY_HOME:-~/.agent-memory}/store/
+├── memories/<project>/<id>.md   # active/candidate/superseded/archived entries
+├── quarantine/<id>.md           # entries that failed the secret scan; human review required
+├── index.db                     # sqlite3 + FTS5, rebuildable any time via `bun run distill reindex`
+└── INDEX.md                     # human-readable catalog, regenerated at the end of every `distill run`
+```
+
+`index.db` is a derived cache, not a source of truth, so it's safe to delete
+and rebuild with `bun run distill reindex`. One caveat: `reindex` only walks
+`memories/`, so quarantined entries (which live under `quarantine/`) drop out
+of `index.db` until they're promoted into `memories/` — `bun run distill
+review`, however, reads `quarantine/` directly and is unaffected (see
+LLM_WIKI for detail).
+
+### Scheduling
+
+The distiller does not schedule itself — run it externally:
+
+```bash
+# cron (crontab -e): once a day at 03:00
+0 3 * * * cd /path/to/opencode-agent-memory && bun run distill run >> ~/.agent-memory/distill.log 2>&1
+```
+
+```xml
+<!-- launchd (~/Library/LaunchAgents/com.agent-memory.distill.plist), macOS -->
+<key>ProgramArguments</key>
+<array>
+  <string>/bin/bash</string>
+  <string>-lc</string>
+  <string>cd /path/to/opencode-agent-memory && bun run distill run</string>
+</array>
+<key>StartCalendarInterval</key>
+<dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>
+```
+
+### opencode-run vs vLLM
+
+By default (`AGENT_MEMORY_LLM` unset) the distiller shells out to `opencode
+run --pure --title distiller "<prompt>"` — this is the **dev fallback**: no
+extra infrastructure to stand up, but slower and only as reliable as whatever
+model opencode itself is configured with. For production, point
+`AGENT_MEMORY_LLM=vllm` at a self-hosted vLLM server
+(`AGENT_MEMORY_VLLM_URL`, `AGENT_MEMORY_VLLM_MODEL`) — it always requests
+`response_format: json_schema` (guided decoding), which yields far more
+reliable strict-JSON output for the EXTRACT/RECONCILE stages than a CLI
+assistant turn.
+
 ## Development
 
 ```bash
 bun install
-bun test          # bun:test, all collector + shared unit tests
+bun test          # bun:test, all collector + distiller + shared unit tests
 bun run typecheck  # tsc --noEmit
 bun run build      # bundles collector/plugin-entry.ts -> dist/agent-memory-collector.js
+bun run distill run [--project <slug>]  # run the distiller pipeline once
 ```
 
 Repo layout:
 
 ```
-shared/     config loading, project slugs, default DB path (shared with distiller later)
+shared/     config loading, project slugs, default DB path (shared with distiller)
 collector/  db.ts (read-only bundle load), transcript.ts (render), export.ts (skip/write rules),
             plugin.ts (session.idle hook), plugin-entry.ts (bundle entrypoint — exports only
             the plugin, per the opencode loader's function-exports-only contract), backfill.ts (CLI)
-distiller/  placeholder — phase 2
-mcp-server/ placeholder — phase 2
+distiller/  cli.ts (run/reindex/review/stats), pipeline.ts (stage orchestration), transcripts.ts
+            (spool scan/parse), extract.ts (prompt + validation), reconcile.ts (Mem0-style ADD/
+            UPDATE/SUPERSEDE/NOOP), store.ts (markdown entry read/write), ledger.ts (sqlite index +
+            idempotency), llm.ts (vllm / opencode-run clients)
+mcp-server/ placeholder — phase 3
 docs/       design spec, research reports, superpowers specs/plans/SPIKE.md
 scripts/    install.sh
 ```
 
 See `docs/superpowers/specs/2026-07-10-agent-memory-design.md` for the full
-architecture and `docs/superpowers/VERIFY.md` for the manual verification
-checklist.
+architecture, `docs/superpowers/VERIFY.md` for the collector's manual
+verification checklist, and `docs/superpowers/VERIFY-distiller.md` for the
+distiller's.
