@@ -201,3 +201,59 @@ test("v1-schema index is auto-rebuilt on first access with rebuild notice on std
   // stderr should contain the rebuild notice
   expect(errText).toContain("rebuilding index")
 })
+
+test("review -> approve -> review empty -> re-approve fails; reject unknown id is a friendly error", async () => {
+  const { dir, env, out, err, deps } = setup()
+
+  // Seed a quarantined pending entry directly (no LLM run needed).
+  mkdirSync(join(dir, "store", "quarantine"), { recursive: true })
+  const { serializeEntry } = await import("./store")
+  const { MemoryIndex } = await import("./ledger")
+  const pending: MemoryEntry = {
+    id: "mem_20260710_pend01",
+    memory_class: "semantic",
+    type: "know_how",
+    title: "Pending Review Entry",
+    trigger: "when reviewing cli",
+    project: "proja",
+    scope: "project",
+    domain: ["testing"],
+    volatile: false,
+    confidence: 0.5,
+    status: "quarantined",
+    superseded_by: null,
+    supersedes: null,
+    review: "human_pending",
+    evidence: [{ session: "ses_1", anchors: ["msg_u1"], observed_at: "2026-07-10T00:00:00.000Z" }],
+    provenance: { extractor: "test", prompt_hash: "h1" },
+    created_at: "2026-07-10T00:00:00.000Z",
+    updated_at: "2026-07-10T00:00:00.000Z",
+    lesson: "This entry is pending human review.",
+    notes: ["pending"],
+  }
+  const qPath = join(dir, "store", "quarantine", `${pending.id}.md`)
+  writeFileSync(qPath, serializeEntry(pending))
+  const seedIndex = new MemoryIndex(join(dir, "store", "index.db"))
+  seedIndex.upsertEntry(pending, qPath)
+  seedIndex.close()
+
+  out.length = 0
+  expect(await runCli(["review"], env, deps)).toBe(0)
+  expect(out.join("\n")).toContain(pending.id)
+
+  out.length = 0
+  expect(await runCli(["approve", pending.id], env, deps)).toBe(0)
+  expect(out.join("\n")).toContain("approved")
+
+  out.length = 0
+  expect(await runCli(["review"], env, deps)).toBe(0)
+  expect(out.join("\n")).toContain("quarantine empty")
+
+  err.length = 0
+  expect(await runCli(["approve", pending.id], env, deps)).toBe(1)
+  expect(err.join("\n")).toContain("not pending")
+
+  err.length = 0
+  expect(await runCli(["reject", "mem_nope"], env, deps)).toBe(1)
+  expect(err.join("\n")).toContain("not found")
+})

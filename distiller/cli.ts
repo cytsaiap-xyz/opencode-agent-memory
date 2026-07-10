@@ -4,10 +4,11 @@ import { loadConfig } from "../shared/config"
 import { clientFromEnv, type LlmClient } from "./llm"
 import { MemoryIndex } from "./ledger"
 import { runPipeline } from "./pipeline"
+import { approveEntry, rejectEntry } from "./reviewops"
 
 export interface CliDeps { llm?: LlmClient; out?: (line: string) => void; err?: (line: string) => void }
 
-const USAGE = "usage: distiller <run [--project <slug>] | reindex | review | stats>"
+const USAGE = "usage: distiller <run [--project <slug>] | reindex | review | approve <id> | reject <id> [--reason <text>] | stats>"
 
 async function openIndex(cfg: { storeDir: string }, onError?: (msg: string) => void): Promise<MemoryIndex> {
   const index = new MemoryIndex(join(cfg.storeDir, "index.db"))
@@ -79,11 +80,11 @@ export async function runCli(
           const { readdirSync } = await import("node:fs")
           const shown: Map<string, boolean> = new Map()
 
-          // Scan memories directory for any quarantined entries a human moved there
+          // Scan memories directory for any pending entries a human moved there
           for (const p of listEntryPaths(cfg.storeDir)) {
             try {
               const e = await readEntry(p)
-              if (e.status === "quarantined") {
+              if (e.review === "human_pending" && e.status !== "archived") {
                 const note = e.notes.at(-1) ?? "no note"
                 out(`${e.id} — ${e.title} (${note})`)
                 shown.set(e.id, true)
@@ -104,7 +105,7 @@ export async function runCli(
             if (!n.endsWith(".md")) continue
             try {
               const e = await readEntry(join(cfg.storeDir, "quarantine", n))
-              if (!shown.has(e.id)) {
+              if (e.review === "human_pending" && e.status !== "archived" && !shown.has(e.id)) {
                 const note = e.notes.at(-1) ?? "no note"
                 out(`${e.id} — ${e.title} (${note})`)
                 shown.set(e.id, true)
@@ -115,6 +116,37 @@ export async function runCli(
           }
 
           if (shown.size === 0) out("quarantine empty")
+          return 0
+        } finally {
+          index.close()
+        }
+      }
+      case "approve": {
+        const id = rest[0]
+        if (!id) throw new Error("approve needs an <id> argument")
+        mkdirSync(cfg.storeDir, { recursive: true })
+        const index = await openIndex(cfg, err)
+        try {
+          const result = await approveEntry(cfg.storeDir, index, id)
+          if (result.warning) err(`distiller: ${result.warning}`)
+          const finalPath = index.getById(result.entry.id)?.path ?? result.movedTo ?? "(unknown path)"
+          out(`approved ${result.entry.id} → ${finalPath}`)
+          return 0
+        } finally {
+          index.close()
+        }
+      }
+      case "reject": {
+        const id = rest[0]
+        if (!id) throw new Error("reject needs an <id> argument")
+        const ri = rest.indexOf("--reason")
+        const reason = ri >= 0 ? rest[ri + 1] : undefined
+        if (ri >= 0 && !reason) throw new Error("--reason needs a value")
+        mkdirSync(cfg.storeDir, { recursive: true })
+        const index = await openIndex(cfg, err)
+        try {
+          const rejected = await rejectEntry(cfg.storeDir, index, id, reason)
+          out(`rejected ${rejected.id}`)
           return 0
         } finally {
           index.close()
