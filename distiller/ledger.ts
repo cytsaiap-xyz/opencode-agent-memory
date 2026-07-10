@@ -62,8 +62,9 @@ export class MemoryIndex {
   upsertEntry(e: MemoryEntry, path: string): void {
     this.db.run(`DELETE FROM memories_fts WHERE id = ?`, [e.id])
     this.db.run(
-      `INSERT OR REPLACE INTO memories (id, project, type, status, confidence, volatile, path, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO memories (id, project, type, status, confidence, volatile, path, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET project=excluded.project, type=excluded.type, status=excluded.status, confidence=excluded.confidence, volatile=excluded.volatile, path=excluded.path, updated_at=excluded.updated_at`,
       [e.id, e.project, e.type, e.status, e.confidence, e.volatile ? 1 : 0, path, e.updated_at],
     )
     this.db.run(`INSERT INTO memories_fts (id, title, trigger, lesson, domain) VALUES (?, ?, ?, ?, ?)`, [
@@ -132,6 +133,11 @@ export class MemoryIndex {
       byType[r.type] = r.n
     const sessions = (this.db.query(`SELECT COUNT(*) AS n FROM processed_sessions`).get() as { n: number }).n
     return { byStatus, byType, sessions }
+  }
+
+  accessStats(id: string): { access_count: number; last_accessed: string | null } | null {
+    const row = this.db.query(`SELECT access_count, last_accessed FROM memories WHERE id = ?`).get(id) as { access_count: number; last_accessed: string | null } | null
+    return row
   }
 
   async rebuildFrom(storeDir: string): Promise<number> {

@@ -106,3 +106,34 @@ test("rebuildFrom does not modify markdown files", async () => {
   expect(parseEntry(readFileSync(p, "utf8"))).toEqual(e)
   idx.close()
 })
+
+test("upsertEntry preserves access_count and last_accessed across re-upserts", async () => {
+  const dir = tmp()
+  const store = join(dir, "store")
+  const idx = new MemoryIndex(join(dir, "index.db"))
+  const e = entry("mem_1")
+  const p = await writeEntry(store, e)
+  idx.upsertEntry(e, p)
+
+  // Record two accesses
+  idx.recordAccess("mem_1")
+  idx.recordAccess("mem_1")
+
+  // Verify access stats after first upsert
+  let stats = idx.accessStats("mem_1")
+  expect(stats).not.toBeNull()
+  expect(stats!.access_count).toBe(2)
+  expect(stats!.last_accessed).not.toBeNull()
+
+  // Update the entry and re-upsert (simulating reconcile)
+  const updated = { ...e, lesson: "Updated lesson." }
+  const updatedPath = await writeEntry(store, updated)
+  idx.upsertEntry(updated, updatedPath)
+
+  // Verify access stats survived the re-upsert
+  stats = idx.accessStats("mem_1")
+  expect(stats).not.toBeNull()
+  expect(stats!.access_count).toBe(2)
+  expect(stats!.last_accessed).not.toBeNull()
+  idx.close()
+})
