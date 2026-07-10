@@ -106,6 +106,23 @@ test("searchMemory: domain filter, limit cap, access recording", async () => {
   expect(searchMemory(index, { query: "SPEF", limit: 999 }, NOW).length).toBeLessThanOrEqual(50)
 })
 
+test("searchMemory: internal fetch pool grows with limit so 31-50 are honorable", async () => {
+  const entries = Array.from({ length: 40 }, (_, i) => entry(`mem_${i}`))
+  const { index } = await setup(entries)
+  // Previously the internal index.search() fetch was hardcoded to 30, so no requested
+  // limit above 30 could ever be satisfied even when enough matches existed.
+  expect(searchMemory(index, { query: "SPEF", limit: 40 }, NOW).length).toBe(40)
+})
+
+test("searchMemory: recordAccess failures (e.g. SQLITE_BUSY) are swallowed, results still returned", async () => {
+  const { index } = await setup([entry("mem_a")])
+  index.recordAccess = () => {
+    throw new Error("SQLITE_BUSY")
+  }
+  const hits = searchMemory(index, { query: "SPEF" }, NOW)
+  expect(hits.map((h) => h.id)).toEqual(["mem_a"])
+})
+
 test("getMemory returns full entry with path and records access; null on miss", async () => {
   const { index } = await setup([entry("mem_a", { notes: ["a note"] })])
   const got = getMemory(index, "mem_a")
@@ -113,6 +130,15 @@ test("getMemory returns full entry with path and records access; null on miss", 
   expect(got!.path.endsWith("mem_a.md")).toBe(true)
   expect(index.accessStats("mem_a")!.access_count).toBe(1)
   expect(getMemory(index, "mem_nope")).toBeNull()
+})
+
+test("getMemory: recordAccess failures (e.g. SQLITE_BUSY) are swallowed, entry still returned", async () => {
+  const { index } = await setup([entry("mem_a")])
+  index.recordAccess = () => {
+    throw new Error("SQLITE_BUSY")
+  }
+  const got = getMemory(index, "mem_a")
+  expect(got!.id).toBe("mem_a")
 })
 
 test("listDomains aggregates active entries only, optionally per project", async () => {

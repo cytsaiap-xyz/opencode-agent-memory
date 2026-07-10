@@ -209,7 +209,8 @@ in Notes for A-MEM-style cross-references.
 
 ## 8. mcp-server/ — query interface
 
-MCP over stdio (`@modelcontextprotocol/sdk`, pinned), single compiled binary.
+MCP over stdio (`@modelcontextprotocol/sdk`, pinned), runs via bun
+(single-binary compile available as optional convenience, per §2).
 
 Tools:
 - `search_memory({ query, project?, type?, domain?, include_tentative? })` —

@@ -144,8 +144,6 @@ export class MemoryIndex {
   }
 
   async rebuildFrom(storeDir: string): Promise<number> {
-    this.db.run(`DELETE FROM memories`)
-    this.db.run(`DELETE FROM memories_fts`)
     // Quarantined entries live under storeDir/quarantine, not storeDir/memories, and would
     // otherwise be permanently dropped from the index by a reindex (rebuildFrom wipes the
     // tables first, so anything not re-scanned here is simply gone).
@@ -156,19 +154,33 @@ export class MemoryIndex {
     } catch {
       // quarantine dir doesn't exist yet
     }
-    let count = 0
+    // File reads (the async part) happen before the transaction opens: a BEGIN IMMEDIATE
+    // held open across `await Bun.file(...).text()` calls would keep the write lock for the
+    // whole rebuild's I/O, not just the DB writes. Read everything first, then do the
+    // DELETE+re-insert as one atomic unit so concurrent WAL readers always see either the
+    // pre-rebuild or post-rebuild index, never a half-wiped one, and a mid-rebuild crash
+    // rolls back instead of leaving the tables empty.
+    const parsed: Array<{ entry: MemoryEntry; path: string }> = []
     for (const path of [...listEntryPaths(storeDir), ...qPaths]) {
       try {
-        const entry = parseEntry(await Bun.file(path).text())
-        this.upsertEntry(entry, path)
-        count++
+        parsed.push({ entry: parseEntry(await Bun.file(path).text()), path })
       } catch (e) {
-        // One corrupt/unparseable file must not abort the whole rebuild after the tables
-        // have already been wiped — skip it, warn, and keep going; count only what parsed.
+        // One corrupt/unparseable file must not abort the whole rebuild — skip it, warn,
+        // and keep going; count only what parsed.
         console.error(`ledger: rebuildFrom: skipping unparseable file ${path}: ${e instanceof Error ? e.message : String(e)}`)
       }
     }
-    return count
+    this.db.run("BEGIN IMMEDIATE")
+    try {
+      this.db.run(`DELETE FROM memories`)
+      this.db.run(`DELETE FROM memories_fts`)
+      for (const { entry, path } of parsed) this.upsertEntry(entry, path)
+      this.db.run("COMMIT")
+    } catch (e) {
+      this.db.run("ROLLBACK")
+      throw e
+    }
+    return parsed.length
   }
 
   close(): void {

@@ -24,7 +24,7 @@ export function searchMemory(index: MemoryIndex, opts: SearchOpts, now: Date = n
     type: opts.type,
     status: "active",
     minConfidence: opts.include_tentative ? 0 : 0.5,
-    limit: 30,
+    limit: Math.max(30, limit),
   })
   if (opts.domain) hits = hits.filter((h) => h.entry.domain.includes(opts.domain!))
   // index.search() returns hits in bm25 order (best match first). Raw bm25 magnitudes are
@@ -41,7 +41,15 @@ export function searchMemory(index: MemoryIndex, opts: SearchOpts, now: Date = n
     .sort((a, b) => a.s - b.s)
     .map((x) => x.h)
   const top = hits.slice(0, limit)
-  for (const h of top) index.recordAccess(h.entry.id)
+  for (const h of top) {
+    try {
+      index.recordAccess(h.entry.id)
+    } catch {
+      // access stats are a nice-to-have signal, not the product; a write-lock
+      // contention (e.g. SQLITE_BUSY while the distiller holds the write lock)
+      // must not turn a successful search into a failed one.
+    }
+  }
   return top.map((h) => ({
     id: h.entry.id, title: h.entry.title, trigger: h.entry.trigger, lesson: h.entry.lesson,
     type: h.entry.type, project: h.entry.project, domain: h.entry.domain,
@@ -52,7 +60,11 @@ export function searchMemory(index: MemoryIndex, opts: SearchOpts, now: Date = n
 export function getMemory(index: MemoryIndex, id: string): (MemoryEntry & { path: string }) | null {
   const hit = index.getById(id)
   if (!hit) return null
-  index.recordAccess(id)
+  try {
+    index.recordAccess(id)
+  } catch {
+    // best-effort — see searchMemory's recordAccess guard for rationale
+  }
   return { ...hit.entry, path: hit.path }
 }
 
