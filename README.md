@@ -18,7 +18,25 @@ This repo ships all three components. See
 `docs/superpowers/specs/2026-07-10-agent-memory-design.md` for the full
 design.
 
-## Install
+## Quick start (one command)
+
+```bash
+./scripts/setup.sh --backfill --schedule "0 3 * * *"
+```
+
+Idempotent one-shot setup: installs the collector plugin globally, registers
+the MCP server in `~/.config/opencode/opencode.json` (merge — existing config
+is never clobbered; invalid JSON aborts), exports all historical sessions,
+and installs a nightly `distill run` cron entry via `scripts/run-distill.sh`
+(logs to `~/.agent-memory/distill.log`, resolves bun without relying on
+cron's PATH). Both flags are optional; re-running is always safe. Restart
+opencode afterwards.
+
+macOS note: cron may need Full Disk Access if the repo lives under
+Documents/Desktop (TCC). On servers, a systemd timer calling
+`scripts/run-distill.sh` works equally well.
+
+## Install (collector only)
 
 ```bash
 ./scripts/install.sh
