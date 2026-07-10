@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS memories (
   confidence REAL NOT NULL, volatile INTEGER NOT NULL, path TEXT NOT NULL,
   updated_at TEXT NOT NULL, access_count INTEGER NOT NULL DEFAULT 0, last_accessed TEXT
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, title, trigger, lesson, domain);
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, title, trigger, lesson, domain, tokenize = 'trigram');
 `
 
 const ftsQuery = (query: string): string =>
@@ -36,12 +36,31 @@ const ftsQuery = (query: string): string =>
 
 export class MemoryIndex {
   private db: Database
+  readonly ftsRebuildNeeded: boolean
 
   constructor(dbPath: string) {
     this.db = new Database(dbPath, { create: true })
     this.db.run("PRAGMA journal_mode = WAL")
     this.db.run("PRAGMA busy_timeout = 5000")
-    this.db.run(DDL)
+
+    // Check schema version and perform migration if needed
+    const currentVersion = (this.db.query("PRAGMA user_version").get() as { user_version: number }).user_version
+
+    if (currentVersion < 2) {
+      // v0 or v1 → v2 migration: drop old FTS table and recreate with trigram
+      this.db.run("DROP TABLE IF EXISTS memories_fts")
+      this.db.run(DDL)
+
+      // Check if there are existing entries that need reindexing
+      const memoryCount = (this.db.query("SELECT COUNT(*) as n FROM memories").get() as { n: number }).n
+      this.ftsRebuildNeeded = memoryCount > 0
+
+      this.db.run("PRAGMA user_version = 2")
+    } else {
+      // Fresh DB or already at v2
+      this.db.run(DDL)
+      this.ftsRebuildNeeded = false
+    }
   }
 
   isProcessed(sessionId: string, contentHash: string): boolean {
@@ -83,31 +102,76 @@ export class MemoryIndex {
     query: string,
     opts: { project?: string; type?: string; status?: string; minConfidence?: number; limit?: number } = {},
   ): SearchHit[] {
-    const fts = ftsQuery(query)
-    if (!fts) return []
-    const conds: string[] = ["memories_fts MATCH ?"]
-    const params: (string | number)[] = [fts]
-    if (opts.project) { conds.push("m.project = ?"); params.push(opts.project) }
-    if (opts.type) { conds.push("m.type = ?"); params.push(opts.type) }
-    if (opts.status) { conds.push("m.status = ?"); params.push(opts.status) }
-    if (opts.minConfidence !== undefined) { conds.push("m.confidence >= ?"); params.push(opts.minConfidence) }
-    params.push(opts.limit ?? 10)
-    const rows = this.db
-      .query(
-        `SELECT m.path AS path, bm25(memories_fts) AS score
-         FROM memories_fts JOIN memories m ON m.id = memories_fts.id
-         WHERE ${conds.join(" AND ")} ORDER BY score LIMIT ?`,
-      )
-      .all(...params) as Array<{ path: string; score: number }>
-    const hits: SearchHit[] = []
-    for (const r of rows) {
-      try {
-        hits.push({ entry: parseEntry(readFileSync(r.path, "utf8")), path: r.path, score: r.score })
-      } catch {
-        // stale index row (file moved/deleted) — skip; reindex heals
+    // Split tokens and partition by code-point length
+    const tokens = query
+      .split(/[^\p{L}\p{N}_]+/u)
+      .filter(Boolean)
+
+    const longTokens = tokens.filter((t) => [...t].length >= 3)
+    const shortTokens = tokens.filter((t) => [...t].length < 3)
+
+    // Collect metadata filter conditions
+    const metadataConds: string[] = []
+    const metadataParams: (string | number)[] = []
+    if (opts.project) { metadataConds.push("m.project = ?"); metadataParams.push(opts.project) }
+    if (opts.type) { metadataConds.push("m.type = ?"); metadataParams.push(opts.type) }
+    if (opts.status) { metadataConds.push("m.status = ?"); metadataParams.push(opts.status) }
+    if (opts.minConfidence !== undefined) { metadataConds.push("m.confidence >= ?"); metadataParams.push(opts.minConfidence) }
+
+    if (longTokens.length > 0) {
+      // Use MATCH path with long tokens only
+      const fts = longTokens.map((t) => `"${t}"`).join(" OR ")
+      const conds: string[] = ["memories_fts MATCH ?", ...metadataConds]
+      const params: (string | number)[] = [fts, ...metadataParams]
+      params.push(opts.limit ?? 10)
+      const rows = this.db
+        .query(
+          `SELECT m.path AS path, bm25(memories_fts) AS score
+           FROM memories_fts JOIN memories m ON m.id = memories_fts.id
+           WHERE ${conds.join(" AND ")} ORDER BY score LIMIT ?`,
+        )
+        .all(...params) as Array<{ path: string; score: number }>
+      const hits: SearchHit[] = []
+      for (const r of rows) {
+        try {
+          hits.push({ entry: parseEntry(readFileSync(r.path, "utf8")), path: r.path, score: r.score })
+        } catch {
+          // stale index row (file moved/deleted) — skip; reindex heals
+        }
       }
+      return hits
+    } else if (shortTokens.length > 0) {
+      // LIKE fallback: per-token, per-column OR-joined
+      const likeCondParts: string[] = []
+      const likeParams: (string | number)[] = []
+      for (const tok of shortTokens) {
+        const pattern = `%${tok}%`
+        likeCondParts.push("(f.title LIKE ? OR f.trigger LIKE ? OR f.lesson LIKE ? OR f.domain LIKE ?)")
+        likeParams.push(pattern, pattern, pattern, pattern)
+      }
+      const likeCond = likeCondParts.join(" OR ")
+      const conds: string[] = [likeCond, ...metadataConds]
+      const params: (string | number)[] = [...likeParams, ...metadataParams]
+      params.push(opts.limit ?? 10)
+      const rows = this.db
+        .query(
+          `SELECT m.path AS path, 0 AS score
+           FROM memories_fts f JOIN memories m ON m.id = f.id
+           WHERE ${conds.join(" AND ")} ORDER BY m.confidence DESC LIMIT ?`,
+        )
+        .all(...params) as Array<{ path: string; score: number }>
+      const hits: SearchHit[] = []
+      for (const r of rows) {
+        try {
+          hits.push({ entry: parseEntry(readFileSync(r.path, "utf8")), path: r.path, score: r.score })
+        } catch {
+          // stale index row (file moved/deleted) — skip; reindex heals
+        }
+      }
+      return hits
     }
-    return hits
+
+    return []
   }
 
   getById(id: string): SearchHit | null {

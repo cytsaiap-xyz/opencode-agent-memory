@@ -195,3 +195,87 @@ test("upsertEntry preserves access_count and last_accessed across re-upserts", a
   expect(stats!.last_accessed).not.toBeNull()
   idx.close()
 })
+
+test("CJK content is searchable after trigram", async () => {
+  const dir = tmp()
+  const idx = new MemoryIndex(join(dir, "index.db"))
+  const e = entry("mem_cjk", { title: "時序收斂技巧", lesson: "在慢角優先修 hold，時序收斂前先跑 retiming。" })
+  idx.upsertEntry(e, await writeEntry(join(dir, "store"), e))
+
+  const hits1 = idx.search("時序收斂")
+  expect(hits1.length).toBe(1)
+  expect(hits1[0]!.entry.id).toBe("mem_cjk")
+
+  const hits2 = idx.search("收斂技巧")
+  expect(hits2.length).toBe(1)
+  expect(hits2[0]!.entry.id).toBe("mem_cjk")
+  idx.close()
+})
+
+test("two-char CJK query matches via LIKE fallback", async () => {
+  const dir = tmp()
+  const idx = new MemoryIndex(join(dir, "index.db"))
+  const e = entry("mem_cjk", { title: "時序收斂技巧", lesson: "在慢角優先修 hold，時序收斂前先跑 retiming。" })
+  idx.upsertEntry(e, await writeEntry(join(dir, "store"), e))
+
+  const hits1 = idx.search("時序")
+  expect(hits1.length).toBe(1)
+  expect(hits1[0]!.entry.id).toBe("mem_cjk")
+
+  const hits2 = idx.search("首都")
+  expect(hits2.length).toBe(0)
+  idx.close()
+})
+
+test("migration from v1 schema flags rebuild", async () => {
+  const dir = tmp()
+  const dbPath = join(dir, "index.db")
+
+  // Create v0 schema database manually
+  const oldDb = new (await import("bun:sqlite")).Database(dbPath, { create: true })
+  const oldDDL = `
+    CREATE TABLE IF NOT EXISTS processed_sessions (
+      session_id TEXT NOT NULL, content_hash TEXT NOT NULL, pipeline_version TEXT NOT NULL,
+      extractor_model TEXT NOT NULL, processed_at TEXT NOT NULL,
+      n_candidates INTEGER NOT NULL, n_committed INTEGER NOT NULL,
+      PRIMARY KEY (session_id, content_hash, pipeline_version)
+    );
+    CREATE TABLE IF NOT EXISTS memories (
+      id TEXT PRIMARY KEY, project TEXT NOT NULL, type TEXT NOT NULL, status TEXT NOT NULL,
+      confidence REAL NOT NULL, volatile INTEGER NOT NULL, path TEXT NOT NULL,
+      updated_at TEXT NOT NULL, access_count INTEGER NOT NULL DEFAULT 0, last_accessed TEXT
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, title, trigger, lesson, domain);
+  `
+  oldDb.run(oldDDL)
+  // Insert a dummy entry
+  oldDb.run(`INSERT INTO memories (id, project, type, status, confidence, volatile, path, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["mem_1", "test", "pitfall", "active", 0.5, 0, "/tmp/test.md", "2026-07-10T00:00:00.000Z"])
+  // Don't set user_version (v0 database)
+  oldDb.close()
+
+  // Open with MemoryIndex — should flag rebuild
+  const idx = new MemoryIndex(dbPath)
+  expect(idx.ftsRebuildNeeded).toBe(true)
+
+  // Prepare store and rebuild
+  const store = join(dir, "store")
+  const e = entry("mem_1", { title: "Test Entry" })
+  await writeEntry(store, e)
+
+  await idx.rebuildFrom(store)
+  expect(idx.search("Test").length).toBe(1)
+  idx.close()
+
+  // Open again — should not flag rebuild
+  const idx2 = new MemoryIndex(dbPath)
+  expect(idx2.ftsRebuildNeeded).toBe(false)
+  idx2.close()
+})
+
+test("fresh db needs no rebuild", () => {
+  const dbPath = join(tmp(), "index.db")
+  const idx = new MemoryIndex(dbPath)
+  expect(idx.ftsRebuildNeeded).toBe(false)
+  idx.close()
+})
