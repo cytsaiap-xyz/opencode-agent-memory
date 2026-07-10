@@ -1,6 +1,6 @@
 # VERIFY — mcp-server (Plan 3)
 
-Status: headless items 1-5 EXECUTED 2026-07-10 (final review); interactive items 6-7 PENDING (user)
+Status: items 1-6 EXECUTED AND PASSING 2026-07-10; item 7 optional/pending
 
 Headless items (executor MUST run these, not defer):
 1. `bun test` — all green.
@@ -35,4 +35,14 @@ Interactive items (user):
 6. Register in opencode (opencode.json mcp block per README), restart, ask the
    agent: "search our engineering memory for SPEF" (or any known topic) → agent
    calls search_memory and cites a stored lesson.
+   **EXECUTED: PASS (2026-07-10, live)** — registered in the global
+   `~/.config/opencode/opencode.json` alongside codebase-memory-mcp; asked via
+   `opencode run` for lessons about decimal/monetary values. The agent called
+   `agent-memory_search_memory` four times (varying `type` filters), then
+   `agent-memory_get_memory` on the top hit, and answered citing
+   `mem_20260710_624036` (decision, confidence 0.5): "Use Decimal with
+   ROUND_HALF_UP instead of float for monetary computations" — including the
+   provenance context ("triggered by a prior session where float was used in a
+   tip calculator"). Full closed loop: conversation → transcript → distilled
+   memory → MCP recall by a fresh agent.
 7. Optional: register in Claude Code and repeat.
