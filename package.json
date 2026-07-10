@@ -1,0 +1,16 @@
+{
+  "name": "agent-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build collector/plugin-entry.ts --outfile dist/agent-memory-collector.js --target bun --format esm",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.17.9",
+    "@types/bun": "latest",
+    "typescript": "^5.9.0"
+  }
+}
