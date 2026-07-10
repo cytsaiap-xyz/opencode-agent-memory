@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdirSync, mkdtempSync, writeFileSync, existsSync, readFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { loadConfig } from "../shared/config"
@@ -132,4 +132,34 @@ test("LLM failure counts an error, leaves session unprocessed for retry", async 
   expect(index.isProcessed("ses_1", "sha256:h1")).toBe(false)
   const retry = await runPipeline(cfg, { llm: scriptedLlm([candidateJson("Fix X", "Do Y.")]), index }, { now: NOW })
   expect(retry.ops.added).toBe(1)
+})
+
+test("quarantined entries render in INDEX.md under ## Quarantine section", async () => {
+  const { cfg, index } = setup()
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcript("ses_1", "sha256:h1", "leaky"))
+  const llm = scriptedLlm([candidateJson("Key setup", "Set AKIA0123456789ABCDEF first.")])
+  const s = await runPipeline(cfg, { llm, index }, { now: NOW })
+  expect(s.quarantined).toBe(1)
+  const indexMd = readFileSync(join(cfg.storeDir, "INDEX.md"), "utf8")
+  expect(indexMd).toContain("## Quarantine")
+  expect(indexMd).toContain("Key setup")
+})
+
+test("colliding quarantine entries are uniquified with numeric suffixes", async () => {
+  const { cfg, index } = setup()
+  // Two sessions with same project and title but different content hashes
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcript("ses_1", "sha256:h1", "leaky 1"))
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_2.md"), transcript("ses_2", "sha256:h2", "leaky 2"))
+  const secretTitle = "AWS Credentials"
+  const llm = scriptedLlm([
+    candidateJson(secretTitle, "Never set AKIA0123456789ABCDEF as env var."),
+    candidateJson(secretTitle, "Never set AKIA9876543210FEDCBA as env var."),
+  ])
+  const s = await runPipeline(cfg, { llm, index }, { now: NOW })
+  expect(s.quarantined).toBe(2)
+  const quarantineDir = join(cfg.storeDir, "quarantine")
+  const files = readdirSync(quarantineDir)
+  expect(files.length).toBe(2)
+  // Both files should exist
+  expect(files.every((f) => f.endsWith(".md"))).toBe(true)
 })

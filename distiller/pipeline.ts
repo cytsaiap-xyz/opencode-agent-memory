@@ -1,4 +1,5 @@
 import { mkdir } from "node:fs/promises"
+import { existsSync, readdirSync } from "node:fs"
 import { dirname, join } from "node:path"
 import type { MemoryConfig } from "../shared/config"
 import { buildExtractPrompt, EXTRACT_SCHEMA, validateCandidates, type Candidate } from "./extract"
@@ -82,7 +83,16 @@ export async function runPipeline(
       for (const sec of validated.secrets) {
         const qe = quarantineEntry(sec.item, meta, now, extractor, promptHash)
         qe.notes.push(`${now.toISOString().slice(0, 10)}: quarantined — secret scan: ${sec.matches.join(", ")}`)
-        const qPath = quarantinePath(cfg.storeDir, qe.id)
+        let qPath = quarantinePath(cfg.storeDir, qe.id)
+        // Uniquify if file already exists
+        if (existsSync(qPath)) {
+          let suffix = 2
+          while (existsSync(quarantinePath(cfg.storeDir, `${qe.id}-${suffix}`))) {
+            suffix++
+          }
+          qe.id = `${qe.id}-${suffix}`
+          qPath = quarantinePath(cfg.storeDir, qe.id)
+        }
         await mkdir(dirname(qPath), { recursive: true })
         await Bun.write(qPath, serializeEntry(qe))
         deps.index.upsertEntry(qe, qPath)
@@ -126,6 +136,22 @@ export async function renderIndexMd(storeDir: string): Promise<void> {
         list.push(e)
         byProject.set(e.project, list)
       }
+    } catch {
+      // unparseable entry: skip in index rendering
+    }
+  }
+  // Also enumerate quarantine directory
+  const quarantineDir = join(storeDir, "quarantine")
+  let qFiles: string[] = []
+  try {
+    qFiles = readdirSync(quarantineDir).filter((f) => f.endsWith(".md")).map((f) => join(quarantineDir, f))
+  } catch {
+    // quarantine dir doesn't exist yet
+  }
+  for (const path of qFiles) {
+    try {
+      const e = await readEntry(path)
+      quarantined.push(e)
     } catch {
       // unparseable entry: skip in index rendering
     }
