@@ -1,11 +1,11 @@
 import { expect, test } from "bun:test"
-import { mkdtempSync, mkdirSync } from "node:fs"
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { LlmClient } from "./llm"
 import { MemoryIndex } from "./ledger"
 import { parseReconcileOp, reconcileCandidate } from "./reconcile"
-import { readEntry, writeEntry } from "./store"
+import { entryId, entryPath, readEntry, writeEntry } from "./store"
 import type { Candidate } from "./extract"
 import type { TranscriptMeta } from "./transcripts"
 import type { MemoryEntry } from "./types"
@@ -126,4 +126,72 @@ test("NOOP writes nothing", async () => {
   const e = index.search("SPEF")[0]!.entry
   expect(e.evidence.length).toBe(1)
   expect(e.updated_at).toBe("2026-07-10T00:00:00.000Z")
+})
+
+const NOW = new Date("2026-07-11T02:00:00.000Z")
+
+test("ADD collision with non-active existing entry uniquifies id, leaves existing untouched", async () => {
+  const targetId = entryId(meta.project, cand().title, NOW)
+  const seed = existing(targetId, { status: "quarantined" })
+  const { storeDir, index } = await setup(seed)
+  const before = await readEntry(entryPath(storeDir, seed))
+  let called = 0
+  const llm: LlmClient = { describe: () => "f", complete: async () => { called++; return '{"op":"ADD"}' } }
+  const r = await reconcileCandidate(cand(), meta, deps({ llm, index, storeDir }))
+  expect(r.op).toBe("ADD")
+  expect(called).toBe(0) // quarantined entry isn't an active neighbor -> no LLM call
+  const after = await readEntry(entryPath(storeDir, seed))
+  expect(after).toEqual(before) // existing quarantined entry's file is untouched
+  const uniquified = index.getById(`${targetId}-2`)
+  expect(uniquified).not.toBeNull()
+  expect(r.entry!.id).toBe(`${targetId}-2`)
+})
+
+test("ADD collision with active existing entry degrades to UPDATE instead of overwriting", async () => {
+  const targetId = entryId(meta.project, cand().title, NOW)
+  const seed = existing(targetId) // active by default, same title so it also FTS-matches
+  const { storeDir, index } = await setup(seed)
+  const r = await reconcileCandidate(cand(), meta, deps({ llm: fakeLlm('{"op":"ADD"}'), index, storeDir }))
+  expect(r.op).toBe("UPDATE")
+  expect(r.entry!.evidence.length).toBe(2)
+  expect(r.entry!.id).toBe(targetId)
+  const hits = index.search("SPEF")
+  expect(hits.length).toBe(1) // only one entry exists for this id, no duplicate written
+})
+
+test("UPDATE target drifted out of the index (file deleted) falls back to ADD", async () => {
+  const seed = existing("mem_20260710_aaaaaa")
+  const { storeDir, index } = await setup(seed)
+  const seedPath = entryPath(storeDir, seed)
+  const llm: LlmClient = {
+    describe: () => "f",
+    complete: async () => {
+      rmSync(seedPath) // index row still points at this path -> getById now misses
+      return '{"op":"UPDATE","target_id":"mem_20260710_aaaaaa","note":"n"}'
+    },
+  }
+  const r = await reconcileCandidate(cand(), meta, deps({ llm, index, storeDir }))
+  expect(r.op).toBe("ADD")
+  expect(r.entry).toBeDefined()
+  expect(index.getById(r.entry!.id)).not.toBeNull()
+})
+
+test("UPDATE target superseded mid-flight falls back to ADD without polluting the tombstone", async () => {
+  const seed = existing("mem_20260710_aaaaaa")
+  const { storeDir, index } = await setup(seed)
+  const llm: LlmClient = {
+    describe: () => "f",
+    complete: async () => {
+      const superseded: MemoryEntry = { ...seed, status: "superseded", updated_at: "2026-07-10T12:00:00.000Z" }
+      const path = await writeEntry(storeDir, superseded)
+      index.upsertEntry(superseded, path)
+      return '{"op":"UPDATE","target_id":"mem_20260710_aaaaaa","note":"n"}'
+    },
+  }
+  const r = await reconcileCandidate(cand(), meta, deps({ llm, index, storeDir }))
+  expect(r.op).toBe("ADD")
+  const after = await readEntry(entryPath(storeDir, seed))
+  expect(after.status).toBe("superseded")
+  expect(after.evidence.length).toBe(1)
+  expect(after.notes.length).toBe(0)
 })

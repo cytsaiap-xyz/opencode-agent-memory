@@ -83,11 +83,14 @@ function entryFromCandidate(c: Candidate, meta: TranscriptMeta, deps: ReconcileD
   }
 }
 
+// Returns null (no mutation) when the target has drifted out of the index (row/file
+// mismatch) or is no longer "active" (e.g. superseded mid-flight) — callers must degrade
+// to an ADD instead of throwing or polluting a frozen tombstone with fresh evidence/notes.
 async function applyUpdate(
   targetId: string, note: string, c: Candidate, meta: TranscriptMeta, deps: ReconcileDeps,
-): Promise<MemoryEntry> {
+): Promise<MemoryEntry | null> {
   const hit = deps.index.getById(targetId)
-  if (!hit) throw new Error(`reconcile: target ${targetId} not found in index`)
+  if (!hit || hit.entry.status !== "active") return null
   const target = hit.entry
   const day = deps.now.toISOString().slice(0, 10)
   if (!target.evidence.some((ev) => ev.session === meta.sessionId))
@@ -103,6 +106,43 @@ async function applyUpdate(
   const newPath = await writeEntry(deps.storeDir, target)
   deps.index.upsertEntry(target, newPath)
   return target
+}
+
+// Shared by the ADD path and the SUPERSEDE new-entry path. Checks the FULL store by id
+// (not just the active FTS neighbors passed in from the caller), so an existing entry that
+// isn't surfaced as a neighbor — quarantined, archived, or simply outside the FTS top-N —
+// can never be silently overwritten by writeEntry:
+//   - no existing entry with this id -> plain ADD.
+//   - existing entry is "active"     -> degrade to an UPDATE (re-extraction of the same
+//                                       project+title+day knowledge); applyUpdate is
+//                                       guaranteed to succeed since we just confirmed active.
+//   - existing entry is any other status -> the collision is with a frozen/dead entry, not
+//                                       live knowledge; uniquify the id and ADD a fresh
+//                                       entry, leaving the existing one completely untouched.
+async function addEntry(
+  c: Candidate, meta: TranscriptMeta, deps: ReconcileDeps,
+): Promise<{ op: "ADD" | "UPDATE"; entry: MemoryEntry }> {
+  const entry = entryFromCandidate(c, meta, deps)
+  const collision = deps.index.getById(entry.id)
+  if (!collision) {
+    const path = await writeEntry(deps.storeDir, entry)
+    deps.index.upsertEntry(entry, path)
+    return { op: "ADD", entry }
+  }
+  if (collision.entry.status === "active") {
+    const updated = await applyUpdate(entry.id, "re-extracted", c, meta, deps)
+    return { op: "UPDATE", entry: updated! }
+  }
+  let suffix = 2
+  let id = `${entry.id}-${suffix}`
+  while (deps.index.getById(id)) {
+    suffix++
+    id = `${entry.id}-${suffix}`
+  }
+  const uniquified: MemoryEntry = { ...entry, id }
+  const path = await writeEntry(deps.storeDir, uniquified)
+  deps.index.upsertEntry(uniquified, path)
+  return { op: "ADD", entry: uniquified }
 }
 
 export async function reconcileCandidate(
@@ -121,23 +161,23 @@ export async function reconcileCandidate(
   }
 
   switch (decision.op) {
-    case "ADD": {
-      const entry = entryFromCandidate(c, meta, deps)
-      const collision = neighbors.find((h) => h.entry.id === entry.id)
-      if (collision) return { op: "UPDATE", entry: await applyUpdate(entry.id, "re-extracted", c, meta, deps) }
-      const path = await writeEntry(deps.storeDir, entry)
-      deps.index.upsertEntry(entry, path)
-      return { op: "ADD", entry }
+    case "ADD":
+      return await addEntry(c, meta, deps)
+    case "UPDATE": {
+      const updated = await applyUpdate(decision.target_id, decision.note, c, meta, deps)
+      // Drifted out of the index or no longer active (superseded mid-flight): the
+      // knowledge must not be silently dropped, so fall back to adding it fresh.
+      if (updated) return { op: "UPDATE", entry: updated }
+      return await addEntry(c, meta, deps)
     }
-    case "UPDATE":
-      return { op: "UPDATE", entry: await applyUpdate(decision.target_id, decision.note, c, meta, deps) }
     case "SUPERSEDE": {
       const target = neighbors.find((h) => h.entry.id === decision.target_id)!
-      const entry = entryFromCandidate(c, meta, deps)
-      if (entry.id === target.entry.id)
-        return { op: "UPDATE", entry: await applyUpdate(entry.id, "re-extracted", c, meta, deps) }
-      const path = await writeEntry(deps.storeDir, entry)
-      deps.index.upsertEntry(entry, path)
+      const added = await addEntry(c, meta, deps)
+      // addEntry degraded to UPDATE (the candidate's computed id collided with an active
+      // entry — normally the target itself, since it came from these same active
+      // neighbors): nothing new was created, so there is nothing to tombstone.
+      if (added.op === "UPDATE") return added
+      const entry = added.entry
       const old = target.entry
       old.status = "superseded"
       old.superseded_by = entry.id
