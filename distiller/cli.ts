@@ -70,27 +70,37 @@ export async function runCli(
 
           // Scan memories directory for any quarantined entries a human moved there
           for (const p of listEntryPaths(cfg.storeDir)) {
-            const e = await readEntry(p)
-            if (e.status === "quarantined") {
-              const note = e.notes.at(-1) ?? "no note"
-              out(`${e.id} — ${e.title} (${note})`)
-              shown.set(e.id, true)
+            try {
+              const e = await readEntry(p)
+              if (e.status === "quarantined") {
+                const note = e.notes.at(-1) ?? "no note"
+                out(`${e.id} — ${e.title} (${note})`)
+                shown.set(e.id, true)
+              }
+            } catch {
+              err(`skipping corrupt entry: ${p}`)
             }
           }
 
           // Scan quarantine directory
+          let quarantineNames: string[] = []
           try {
-            for (const n of readdirSync(join(cfg.storeDir, "quarantine"))) {
-              if (!n.endsWith(".md")) continue
+            quarantineNames = readdirSync(join(cfg.storeDir, "quarantine"))
+          } catch {
+            // no quarantine dir
+          }
+          for (const n of quarantineNames) {
+            if (!n.endsWith(".md")) continue
+            try {
               const e = await readEntry(join(cfg.storeDir, "quarantine", n))
               if (!shown.has(e.id)) {
                 const note = e.notes.at(-1) ?? "no note"
                 out(`${e.id} — ${e.title} (${note})`)
                 shown.set(e.id, true)
               }
+            } catch {
+              err(`skipping corrupt entry: quarantine/${n}`)
             }
-          } catch {
-            // no quarantine dir
           }
 
           if (shown.size === 0) out("quarantine empty")

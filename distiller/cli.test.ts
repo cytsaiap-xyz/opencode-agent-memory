@@ -77,3 +77,58 @@ test("unknown command and bad env are friendly errors", async () => {
   expect(await runCli(["run"], { ...env, AGENT_MEMORY_IDLE_HOURS: "banana" }, deps)).toBe(1)
   expect(err.join("\n")).toContain("AGENT_MEMORY_IDLE_HOURS")
 })
+
+test("review skips corrupt entry files instead of hiding or failing", async () => {
+  const { dir, env, out, err, deps } = setup()
+  mkdirSync(join(dir, "transcripts", "proja"), { recursive: true })
+  writeFileSync(join(dir, "transcripts", "proja", "ses_1.md"), transcript)
+  expect(await runCli(["run"], env, { ...deps, llm })).toBe(0)
+
+  // Create a valid quarantined entry
+  mkdirSync(join(dir, "store", "quarantine"), { recursive: true })
+  const { serializeEntry } = await import("./store")
+  const validQuarantined: any = {
+    id: "mem_q1",
+    memory_class: "semantic",
+    type: "know_how",
+    title: "Valid Quarantine",
+    trigger: "when reviewing",
+    project: "proja",
+    scope: "project",
+    domain: ["testing"],
+    volatile: false,
+    confidence: 0.8,
+    status: "quarantined",
+    superseded_by: null,
+    review: "human_pending",
+    evidence: [{ session: "ses_1", anchors: ["msg_u1"], observed_at: "2026-07-10T00:00:00.000Z" }],
+    provenance: { extractor: "test", prompt_hash: "h1" },
+    created_at: "2026-07-10T02:00:00.000Z",
+    updated_at: "2026-07-10T02:00:00.000Z",
+    lesson: "This is a valid quarantined entry.",
+    notes: ["Review pending"],
+  }
+  writeFileSync(join(dir, "store", "quarantine", "zzz_valid.md"), serializeEntry(validQuarantined))
+
+  // Add corrupt file in quarantine
+  writeFileSync(join(dir, "store", "quarantine", "aaa_bad.md"), "not a valid entry")
+
+  // Add corrupt file in memories
+  mkdirSync(join(dir, "store", "memories", "proja"), { recursive: true })
+  writeFileSync(join(dir, "store", "memories", "proja", "bad.md"), "corrupt memory")
+
+  out.length = 0
+  err.length = 0
+  expect(await runCli(["review"], env, deps)).toBe(0)
+  const outText = out.join("\n")
+  const errText = err.join("\n")
+
+  // Should list valid entry
+  expect(outText).toContain("mem_q1")
+  expect(outText).toContain("Valid Quarantine")
+  // Should NOT say quarantine is empty
+  expect(outText).not.toContain("quarantine empty")
+  // Should emit warnings for corrupt files
+  expect(errText).toContain("quarantine/aaa_bad.md")
+  expect(errText).toContain("memories/proja/bad.md")
+})
