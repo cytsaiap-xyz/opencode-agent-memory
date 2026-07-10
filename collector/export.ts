@@ -27,8 +27,12 @@ export async function exportSession(
   const path = join(cfg.transcriptsDir, slug, `${bundle.session.id}.md`)
   const existing = Bun.file(path)
   if (await existing.exists()) {
-    const head = (await existing.text()).slice(0, 600)
-    if (head.includes(`content_hash: ${rendered.contentHash}`)) return { status: "unchanged", path }
+    const fullText = await existing.text()
+    const secondDashEnd = fullText.indexOf("\n---", 1)
+    if (secondDashEnd !== -1) {
+      const frontmatter = fullText.slice(0, secondDashEnd)
+      if (frontmatter.includes(`content_hash: ${rendered.contentHash}`)) return { status: "unchanged", path }
+    }
   }
 
   await mkdir(dirname(path), { recursive: true })

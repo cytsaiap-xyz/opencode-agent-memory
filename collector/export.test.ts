@@ -75,3 +75,18 @@ test("re-export after session grows overwrites with new hash", async () => {
   expect(second.status).toBe("written")
   expect(readFileSync(first.path!, "utf8")).toContain("more")
 })
+
+test("unchanged detection works with long session title (700+ chars)", async () => {
+  const longTitle = "t".repeat(700)
+  const longTitleSession: FixtureSession = {
+    ...richSession("ses_long"),
+    title: longTitle,
+  }
+  const { dbPath, cfg } = setup([longTitleSession])
+  const first = await exportSession(cfg, dbPath, "ses_long", new Date(0))
+  expect(first.status).toBe("written")
+  const mtime1 = statSync(first.path!).mtimeMs
+  const second = await exportSession(cfg, dbPath, "ses_long", new Date(999999))
+  expect(second.status).toBe("unchanged")
+  expect(statSync(first.path!).mtimeMs).toBe(mtime1)
+})
