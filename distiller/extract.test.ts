@@ -38,6 +38,13 @@ test("valid candidate passes; hallucinated anchor rejected with reason", () => {
   expect(r.rejected[0]!.reasons.join()).toContain("hallucinated evidence anchor: msg_FAKE")
 })
 
+test("evidence anchor cited with a leading '#' (echoing the {#msg_id} anchor syntax) is accepted and normalized", () => {
+  const r = validateCandidates(JSON.stringify([cand({ evidence: [{ message_id: "#msg_u1" }] })]), meta, 6)
+  expect(r.rejected.length).toBe(0)
+  expect(r.valid.length).toBe(1)
+  expect(r.valid[0]!.evidence).toEqual([{ message_id: "msg_u1" }])
+})
+
 test("field violations collect ALL reasons; below-salience silently dropped", () => {
   const bad = cand({ type: "vibes", lesson: Array(100).fill("word").join(" "), domain: [] })
   const low = cand({ salience: 3 })

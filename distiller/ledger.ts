@@ -27,13 +27,6 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, title, trigger, lesson, domain, tokenize = 'trigram');
 `
 
-const ftsQuery = (query: string): string =>
-  query
-    .split(/[^\p{L}\p{N}_]+/u)
-    .filter(Boolean)
-    .map((t) => `"${t}"`)
-    .join(" OR ")
-
 export class MemoryIndex {
   private db: Database
   readonly ftsRebuildNeeded: boolean

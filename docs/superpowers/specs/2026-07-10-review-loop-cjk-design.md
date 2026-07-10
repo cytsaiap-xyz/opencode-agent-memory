@@ -73,6 +73,15 @@ In `reconcileCandidate`, when the LLM decides SUPERSEDE and the target entry's
 Other four types (`root_cause`, `pitfall`, `know_how`, `workflow`) keep
 automatic SUPERSEDE — they are factual knowledge, not team policy.
 
+**Amendment (2026-07-10, from live verification):** UPDATE decisions against
+decision/convention targets are gated the same way. Live testing showed the
+reconcile LLM routing a CONTRADICTING session as an UPDATE — merging it into
+the policy memory as corroborating evidence and raising confidence with no
+human in the loop. Since the LLM cannot be trusted to distinguish agreement
+from contradiction, ANY mutation of a policy memory (UPDATE or SUPERSEDE)
+now produces a pending entry instead. Duplicate pending proposals against
+the same target are deduplicated (skipped with a note in the run log).
+
 **Schema change:** `MemoryEntry` gains `supersedes: string | null` (default
 null). Serializer always writes it; parser treats a MISSING `supersedes` line
 as `null` (backward compatibility with the 16 existing store files — this is

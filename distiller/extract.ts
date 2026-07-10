@@ -120,9 +120,19 @@ export function validateCandidates(raw: string, meta: TranscriptMeta, salienceMi
     if (!Array.isArray(o.evidence) || o.evidence.length === 0) reasons.push("evidence must be a non-empty array")
     else
       for (const ev of o.evidence) {
-        const id = (ev as { message_id?: unknown }).message_id
+        const evObj = ev as { message_id?: unknown }
+        const id = evObj.message_id
         if (typeof id !== "string") reasons.push("evidence item missing message_id")
-        else if (!anchors.has(id)) reasons.push(`hallucinated evidence anchor: ${id}`)
+        else {
+          // The LLM naturally echoes the "#" from the {#msg_id} anchor syntax in the
+          // transcript heading — strip a single leading "#" before checking against the
+          // real anchor set, and store the normalized (anchor-matching) id, or a real
+          // citation gets rejected as "hallucinated" and the whole session's candidates
+          // are lost with it.
+          const normalized = id.startsWith("#") ? id.slice(1) : id
+          if (!anchors.has(normalized)) reasons.push(`hallucinated evidence anchor: ${id}`)
+          else evObj.message_id = normalized
+        }
       }
     if (typeof o.salience !== "number") reasons.push("salience must be a number")
     if (typeof o.volatile !== "boolean") reasons.push("volatile must be a boolean")

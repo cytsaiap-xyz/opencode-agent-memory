@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { LlmClient } from "./llm"
@@ -171,6 +171,84 @@ test("SUPERSEDE against convention-type target is intercepted into review queue"
   expect(qHit.entry.review).toBe("human_pending")
   expect(qHit.entry.supersedes).toBe("mem_20260710_aaaaaa")
   expect(qHit.entry.notes.some((n) => n.includes("pending review"))).toBe(true)
+})
+
+test("UPDATE against decision-type target is intercepted into review queue, target untouched", async () => {
+  const seed = existing("mem_20260710_aaaaaa", {
+    type: "decision", title: "Ban useful-skew", trigger: "clock tree", lesson: "Never use useful skew.",
+  })
+  const { storeDir, index } = await setup(seed)
+  const before = await readEntry(entryPath(storeDir, seed))
+  const r = await reconcileCandidate(
+    cand({ type: "decision", title: "Ban useful-skew", trigger: "clock tree", lesson: "Actually useful skew is fine now." }),
+    meta,
+    deps({
+      llm: fakeLlm('{"op":"UPDATE","target_id":"mem_20260710_aaaaaa","note":"session claims useful skew is now fine"}'),
+      index, storeDir,
+    }),
+  )
+  expect(r.op).toBe("SUPERSEDE_PENDING")
+  expect(r.entry).toBeDefined()
+
+  // Target completely untouched: status, evidence, confidence, file all unchanged.
+  const target = index.getById("mem_20260710_aaaaaa")!
+  expect(target.entry.status).toBe("active")
+  expect(target.entry.evidence.length).toBe(1)
+  expect(target.entry.confidence).toBe(0.5)
+  const after = await readEntry(entryPath(storeDir, seed))
+  expect(after).toEqual(before)
+
+  const qHit = index.getById(r.entry!.id)!
+  expect(qHit.entry.status).toBe("quarantined")
+  expect(qHit.entry.review).toBe("human_pending")
+  expect(qHit.entry.supersedes).toBe("mem_20260710_aaaaaa")
+  expect(qHit.entry.notes.some((n) => n.includes("pending review") && n.includes("update"))).toBe(true)
+  expect(existsSync(qHit.path)).toBe(true)
+  expect(qHit.path).toContain("quarantine")
+})
+
+test("UPDATE against know_how target still auto-applies (regression)", async () => {
+  const seed = existing("mem_20260710_aaaaaa", { type: "know_how" })
+  const { storeDir, index } = await setup(seed)
+  const r = await reconcileCandidate(
+    cand(), meta,
+    deps({ llm: fakeLlm('{"op":"UPDATE","target_id":"mem_20260710_aaaaaa","note":"confirmed again"}'), index, storeDir }),
+  )
+  expect(r.op).toBe("UPDATE")
+  expect(r.entry!.evidence.length).toBe(2)
+  expect(r.entry!.confidence).toBe(0.65)
+})
+
+test("two candidates proposing against the same decision target dedupe to a single quarantine file", async () => {
+  const seed = existing("mem_20260710_aaaaaa", {
+    type: "decision", title: "Ban useful-skew", trigger: "clock tree", lesson: "Never use useful skew.",
+  })
+  const { storeDir, index } = await setup(seed)
+
+  const r1 = await reconcileCandidate(
+    cand({ type: "decision", title: "Ban useful-skew", trigger: "clock tree", lesson: "Session A says it's fine now." }),
+    meta,
+    deps({
+      llm: fakeLlm('{"op":"SUPERSEDE","target_id":"mem_20260710_aaaaaa","reason":"session A"}'),
+      index, storeDir,
+    }),
+  )
+  const meta2: TranscriptMeta = { ...meta, sessionId: "ses_3" }
+  const r2 = await reconcileCandidate(
+    cand({ type: "decision", title: "Ban useful-skew", trigger: "clock tree", lesson: "Session B also says fine." }),
+    meta2,
+    deps({
+      llm: fakeLlm('{"op":"SUPERSEDE","target_id":"mem_20260710_aaaaaa","reason":"session B"}'),
+      index, storeDir,
+    }),
+  )
+
+  expect(r1.op).toBe("SUPERSEDE_PENDING")
+  expect(r2.op).toBe("SUPERSEDE_PENDING")
+  expect(r2.entry!.id).toBe(r1.entry!.id) // dedupe returned the SAME existing pending entry
+
+  const files = readdirSync(join(storeDir, "quarantine")).filter((f) => f.endsWith(".md"))
+  expect(files.length).toBe(1) // only one quarantine file, not two
 })
 
 test("NOOP writes nothing", async () => {

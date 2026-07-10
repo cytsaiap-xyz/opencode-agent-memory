@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs"
 import { unlink } from "node:fs/promises"
-import { join } from "node:path"
+import { join, sep } from "node:path"
 import type { MemoryIndex, SearchHit } from "./ledger"
 import { computeConfidence, entryPath, serializeEntry, writeEntry } from "./store"
 import type { MemoryEntry } from "./types"
@@ -48,7 +48,7 @@ export async function approveEntry(
   // move the file out of quarantine/ into memories/<project>/, uniquifying the id on collision.
   let movedTo: string | null = null
   const quarantineDir = join(storeDir, "quarantine")
-  if (currentPath.startsWith(quarantineDir)) {
+  if (currentPath.startsWith(quarantineDir + sep)) {
     let dest = entryPath(storeDir, entry)
     const selfHit = index.getById(entry.id)
     const collision = existsSync(dest) || (selfHit !== null && selfHit.path !== currentPath)

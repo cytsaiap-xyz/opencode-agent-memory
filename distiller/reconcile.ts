@@ -1,9 +1,11 @@
+import { readdirSync, readFileSync } from "node:fs"
+import { join } from "node:path"
 import type { Candidate } from "./extract"
 import { stripFences } from "./extract"
 import type { LlmClient } from "./llm"
 import type { MemoryIndex } from "./ledger"
 import { writeQuarantineEntry } from "./quarantine"
-import { computeConfidence, entryId, writeEntry } from "./store"
+import { computeConfidence, entryId, parseEntry, writeEntry } from "./store"
 import type { TranscriptMeta } from "./transcripts"
 import type { MemoryEntry } from "./types"
 
@@ -152,6 +154,55 @@ async function addEntry(
   return { op: "ADD", entry: uniquified }
 }
 
+// Scans quarantine/*.md for an already-pending proposal against the same target so two
+// candidates (from the same or different sessions/batches) contradicting the same policy
+// memory don't each spawn their own quarantine file — the human reviews one proposal, not
+// a pile of duplicates. Tolerant of unreadable/unparseable files (best-effort dedupe, never
+// fatal) and of a missing quarantine/ directory (nothing pending yet).
+function findExistingPending(storeDir: string, targetId: string): MemoryEntry | null {
+  const quarantineDir = join(storeDir, "quarantine")
+  let files: string[] = []
+  try {
+    files = readdirSync(quarantineDir).filter((f) => f.endsWith(".md"))
+  } catch {
+    return null
+  }
+  for (const f of files) {
+    try {
+      const entry = parseEntry(readFileSync(join(quarantineDir, f), "utf8"))
+      if (entry.supersedes === targetId && entry.status === "quarantined" && entry.review === "human_pending")
+        return entry
+    } catch {
+      // tolerate a corrupt/unparseable quarantine file — skip it, keep scanning
+    }
+  }
+  return null
+}
+
+// Shared by the UPDATE and SUPERSEDE branches: decision/convention memories represent
+// deliberate human calls (banned patterns, team conventions) — an automatic mutation could
+// silently flip a rule the LLM misjudged (or, worse, merge a CONTRADICTING session in as
+// corroborating evidence, observed live). Route these into the quarantine review queue
+// instead of auto-applying; the target is left completely untouched pending human approval.
+async function interceptPending(
+  c: Candidate, meta: TranscriptMeta, deps: ReconcileDeps, targetId: string, verb: "update" | "supersede", detail: string,
+): Promise<{ op: "SUPERSEDE_PENDING"; entry: MemoryEntry }> {
+  const existing = findExistingPending(deps.storeDir, targetId)
+  if (existing) return { op: "SUPERSEDE_PENDING", entry: existing }
+
+  const pending: MemoryEntry = {
+    ...entryFromCandidate(c, meta, deps),
+    status: "quarantined",
+    review: "human_pending",
+    supersedes: targetId,
+  }
+  pending.notes.push(
+    `${deps.now.toISOString().slice(0, 10)}: pending review — proposes to ${verb} ${targetId}: ${detail}`,
+  )
+  const entry = await writeQuarantineEntry(deps.storeDir, deps.index, pending)
+  return { op: "SUPERSEDE_PENDING", entry }
+}
+
 export async function reconcileCandidate(
   c: Candidate, meta: TranscriptMeta, deps: ReconcileDeps,
 ): Promise<{ op: ReconcileOp["op"] | "SUPERSEDE_PENDING"; entry?: MemoryEntry }> {
@@ -171,6 +222,12 @@ export async function reconcileCandidate(
     case "ADD":
       return await addEntry(c, meta, deps)
     case "UPDATE": {
+      const target = neighbors.find((h) => h.entry.id === decision.target_id)!
+      // Same governance gate as SUPERSEDE below: the LLM cannot be trusted to distinguish
+      // agreement from contradiction, so ANY mutation of a decision/convention memory —
+      // not just an explicit SUPERSEDE — goes through human review instead of auto-applying.
+      if (target.entry.type === "decision" || target.entry.type === "convention")
+        return await interceptPending(c, meta, deps, decision.target_id, "update", decision.note)
       const updated = await applyUpdate(decision.target_id, decision.note, c, meta, deps)
       // Drifted out of the index or no longer active (superseded mid-flight): the
       // knowledge must not be silently dropped, so fall back to adding it fresh.
@@ -179,23 +236,8 @@ export async function reconcileCandidate(
     }
     case "SUPERSEDE": {
       const target = neighbors.find((h) => h.entry.id === decision.target_id)!
-      // decision/convention memories represent deliberate human calls (banned patterns,
-      // team conventions) — an automatic SUPERSEDE could silently flip a rule the LLM
-      // misjudged as outdated. Route these into the quarantine review queue instead of
-      // auto-applying; the target is left completely untouched pending human approval.
-      if (target.entry.type === "decision" || target.entry.type === "convention") {
-        const pending: MemoryEntry = {
-          ...entryFromCandidate(c, meta, deps),
-          status: "quarantined",
-          review: "human_pending",
-          supersedes: decision.target_id,
-        }
-        pending.notes.push(
-          `${deps.now.toISOString().slice(0, 10)}: pending review — proposes to supersede ${decision.target_id}: ${decision.reason}`,
-        )
-        const entry = await writeQuarantineEntry(deps.storeDir, deps.index, pending)
-        return { op: "SUPERSEDE_PENDING", entry }
-      }
+      if (target.entry.type === "decision" || target.entry.type === "convention")
+        return await interceptPending(c, meta, deps, decision.target_id, "supersede", decision.reason)
       const added = await addEntry(c, meta, deps)
       // addEntry degraded to UPDATE (the candidate's computed id collided with an active
       // entry — normally the target itself, since it came from these same active
