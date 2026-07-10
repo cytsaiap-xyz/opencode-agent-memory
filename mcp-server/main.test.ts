@@ -19,15 +19,14 @@ test("stdio entry answers initialize and tools/list over real stdio", async () =
   const reader = proc.stdout.getReader()
   const decoder = new TextDecoder()
   let buf = ""
-  const deadline = Date.now() + 10_000
-  while (Date.now() < deadline && !buf.includes('"tools"')) {
-    const { value, done } = await Promise.race([
-      reader.read(),
-      new Promise<{ value: undefined; done: true }>((r) => setTimeout(() => r({ value: undefined, done: true }), deadline - Date.now())),
-    ])
-    if (done && !value) break
-    if (value) buf += decoder.decode(value)
-  }
+  const pump = (async () => {
+    while (!buf.includes('"search_memory"')) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+    }
+  })()
+  await Promise.race([pump, new Promise<void>((r) => setTimeout(r, 10_000))])
   proc.kill()
   expect(buf).toContain('"serverInfo"')
   expect(buf).toContain("agent-memory")
