@@ -12,11 +12,11 @@ Three components, one monorepo, fully on-prem (no external API calls):
 |---|---|---|---|
 | `collector/` | opencode plugin (TS) | on `session.idle`, export the session from `opencode.db` as a human-readable markdown transcript | **shipped** |
 | `distiller/` | scheduled batch CLI (TS+Bun) | filter + consolidate transcripts into structured memory entries via LLM | **shipped** |
-| `mcp-server/` | MCP server (TS+Bun) | query interface over the memory store | upcoming |
+| `mcp-server/` | MCP server (TS+Bun) | query interface over the memory store | **shipped** |
 
-This repo currently ships the **collector** and **distiller**. `mcp-server/`
-is a placeholder for the next phase (see
-`docs/superpowers/specs/2026-07-10-agent-memory-design.md`).
+This repo ships all three components. See
+`docs/superpowers/specs/2026-07-10-agent-memory-design.md` for the full
+design.
 
 ## Install
 
@@ -307,6 +307,75 @@ model opencode itself is configured with. For production, point
 reliable strict-JSON output for the EXTRACT/RECONCILE stages than a CLI
 assistant turn.
 
+## MCP Server
+
+`mcp-server/` exposes the memory store to any MCP-speaking agent host over
+stdio (`@modelcontextprotocol/sdk`), read-only against the store's content.
+
+### Tools
+
+| Tool | Args | Returns | When to call |
+|---|---|---|---|
+| `search_memory` | `query` (required), `project?`, `type?` (one of the six memory types), `domain?`, `include_tentative?` (bool), `limit?` (1-50, default 10) | Ranked list of `{ id, title, trigger, lesson, type, project, domain, confidence, updated_at }` | Before solving a problem — check whether a teammate (or a past agent session) already hit this and left a lesson. |
+| `get_memory` | `id` | Full entry (frontmatter + lesson + `## Notes`) plus its file `path` | You already have a memory `id` (e.g. from a `search_memory` hit or an `INDEX.md`/`[[mem_id]]` reference) and need the full evidence/notes, not just the summary. |
+| `list_domains` | `project?` | Active-memory counts by `domains`, `types`, and `projects` | Orient before searching — see what domain tags and projects actually have coverage. |
+| `memory_stats` | *(none)* | Store totals: `byStatus`, `byType`, `sessions`, `lastProcessedAt`, `quarantineFiles` | Check store health, confirm the distiller is actually running, or size up how much has accumulated. |
+
+`search_memory`'s default filter is `status=active AND confidence >= 0.5`;
+pass `include_tentative: true` to also see lower-confidence candidates.
+Results are FTS5 BM25-ranked, then reordered by rank *position* nudged by
+confidence and a 30-day recency bonus (see LLM_WIKI for the exact formula) —
+so a strong keyword match several ranks ahead of a fresher/higher-confidence
+one still wins.
+
+### Registering with an MCP host
+
+**opencode** (global `~/.config/opencode/opencode.json`, or per-project
+`opencode.json`):
+
+```json
+{
+  "mcp": {
+    "agent-memory": {
+      "type": "local",
+      "command": ["bun", "/ABSOLUTE/PATH/TO/opencode-agent-memory/mcp-server/main.ts"]
+    }
+  }
+}
+```
+
+(Field shapes verified against `@opencode-ai/sdk`'s `McpLocalConfig`:
+`type: "local"`, `command: string[]`, optional `environment` for env vars
+like `AGENT_MEMORY_HOME`.)
+
+**Claude Code**:
+
+```bash
+claude mcp add agent-memory -- bun /ABSOLUTE/PATH/TO/opencode-agent-memory/mcp-server/main.ts
+```
+
+### Probing without an MCP host
+
+`mcp-server/probe.ts` drives the real `buildServer()` over an in-memory MCP
+transport — no host required, useful for smoke-testing a store or debugging
+ranking:
+
+```bash
+bun run mcp:probe "<query>" [--project <slug>]   # calls search_memory
+bun run mcp:probe --stats                        # calls memory_stats
+```
+
+### Concurrency and read-only guarantee
+
+`index.db` is opened with `PRAGMA journal_mode = WAL` and
+`PRAGMA busy_timeout = 5000`, so the mcp-server and a scheduled `distill run`
+can hold it open at the same time without lock errors. The server never
+writes memory content — the only write path is `recordAccess()`, which bumps
+`access_count`/`last_accessed` on `search_memory`/`get_memory` hits as a
+reinforcement signal. This makes it safe to point `mcp-server` at a
+git-synced read replica of the store, as long as `index.db` itself stays
+writable (see LLM_WIKI for what happens if it isn't).
+
 ## Development
 
 ```bash
@@ -315,6 +384,8 @@ bun test          # bun:test, all collector + distiller + shared unit tests
 bun run typecheck  # tsc --noEmit
 bun run build      # bundles collector/plugin-entry.ts -> dist/agent-memory-collector.js
 bun run distill run [--project <slug>]  # run the distiller pipeline once
+bun run mcp                              # start the mcp-server over stdio
+bun run mcp:probe "<query>" | --stats    # probe the server without an MCP host
 ```
 
 Repo layout:
@@ -328,12 +399,14 @@ distiller/  cli.ts (run/reindex/review/stats), pipeline.ts (stage orchestration)
             (spool scan/parse), extract.ts (prompt + validation), reconcile.ts (Mem0-style ADD/
             UPDATE/SUPERSEDE/NOOP), store.ts (markdown entry read/write), ledger.ts (sqlite index +
             idempotency), llm.ts (vllm / opencode-run clients)
-mcp-server/ placeholder — phase 3
+mcp-server/ query.ts (search/rank + get/list/stats over MemoryIndex), server.ts (buildServer():
+            tool registration/schemas), main.ts (stdio entrypoint), probe.ts (in-memory-transport
+            CLI probe, no MCP host required)
 docs/       design spec, research reports, superpowers specs/plans/SPIKE.md
 scripts/    install.sh
 ```
 
 See `docs/superpowers/specs/2026-07-10-agent-memory-design.md` for the full
 architecture, `docs/superpowers/VERIFY.md` for the collector's manual
-verification checklist, and `docs/superpowers/VERIFY-distiller.md` for the
-distiller's.
+verification checklist, `docs/superpowers/VERIFY-distiller.md` for the
+distiller's, and `docs/superpowers/VERIFY-mcp.md` for the mcp-server's.

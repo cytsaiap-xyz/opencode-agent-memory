@@ -22,13 +22,12 @@ opencode.db (live, WAL)
 ~/.agent-memory/store/memories/**.md, index.db (FTS5)
    │
    ▼
-[mcp-server]  search_memory / get_memory / list_domains / memory_stats   ← 尚未實作（phase 3）
+[mcp-server]  search_memory / get_memory / list_domains / memory_stats   ← 已實作（見下方「MCP Server」章節）
 ```
 
-本 repo 目前出貨 **`collector/`** 與 **`distiller/`**。`mcp-server/` 是空
-目錄，等之後的 plan 才會填。`AGENT_MEMORY_HOME`（預設 `~/.agent-memory`）是
-所有輸出的根目錄，設計上 `store/` 之後會整包進 git，跟現有的 markdown
-LLM-wiki 系統共用生態。
+本 repo 三個元件 **`collector/`**、**`distiller/`**、**`mcp-server/`** 都已
+出貨。`AGENT_MEMORY_HOME`（預設 `~/.agent-memory`）是所有輸出的根目錄，設計
+上 `store/` 之後會整包進 git，跟現有的 markdown LLM-wiki 系統共用生態。
 
 collector 的職責僅止於「把一個 session 從資料庫轉成人類可讀的 markdown」，
 不做過濾知識、不呼叫 LLM——那是 distiller 的事。collector 本身是 stateless，
@@ -66,6 +65,8 @@ bun run distill run [--project <slug>]   # 跑一次蒸餾 pipeline
 bun run distill reindex                  # 從 memories/ 重建 index.db
 bun run distill review                   # 列出待人工審查的 quarantine 項目
 bun run distill stats                    # 印出 status/type 統計 + 已處理 session 數
+bun run mcp                              # 啟動 mcp-server（stdio）
+bun run mcp:probe "<query>" | --stats    # 不經任何 MCP host，直接探測 server
 ```
 
 ## 中繼格式契約摘要（spec §5）
@@ -306,6 +307,142 @@ Secret/高熵字串命中的候選不會被丟棄，而是寫成獨立檔案到
    當成沒處理過，重新跑一次完整的 LLM 抽取（`VERIFY-distiller.md`
    item 4 曾經誤寫成兩者等價，已更正）。
 
+## MCP Server
+
+`mcp-server/` 是整個系統唯一的讀取介面：agent 透過 MCP（`stdio` transport）
+呼叫四個 tool 查詢 `store/`，本身不參與 collector/distiller 的寫入路徑。
+
+### 架構（三層）
+
+1. **query 層**（`mcp-server/query.ts`）— 純函式，吃 `MemoryIndex`
+   （`distiller/ledger.ts`，跟 distiller 共用同一支 SQLite wrapper）+
+   `storeDir`，輸出給 tool 用的 plain object。`searchMemory` / `getMemory` /
+   `listDomains` / `memoryStats` 四個函式對應四個 tool，邏輯與 MCP SDK 完全
+   解耦，可以直接單元測試（`query.test.ts`）不用起 server。
+2. **server 層**（`mcp-server/server.ts`）— `buildServer(deps)` 用
+   `@modelcontextprotocol/sdk` 的 `McpServer` 註冊四個 tool，每個 handler
+   都包一層 `guarded()`（try/catch → `{ isError: true, content: [...] }`，
+   絕不讓 tool call 讓整個 server process 掛掉）。inputSchema 用 zod 定義，
+   同時也是 MCP host 端看到的參數說明來源。
+3. **stdio 入口**（`mcp-server/main.ts`）— `import.meta.main` 守衛；
+   `loadConfig()` 讀 `AGENT_MEMORY_HOME`、`mkdirSync(storeDir)`、開
+   `MemoryIndex(index.db)`、`buildServer()`、接上
+   `StdioServerTransport`、註冊 `SIGINT`/`SIGTERM` 關閉 `index`。
+   `mcp-server/probe.ts` 是平行的第二個入口：同樣建 `buildServer()`，但接
+   `InMemoryTransport` 而不是真的 stdio，讓開發者/驗證流程不需要任何
+   MCP host 就能直接呼叫 tool（`bun run mcp:probe`）。
+
+### 四個 tool 與預設過濾
+
+| Tool | 參數 | 回傳 | 用途 |
+|---|---|---|---|
+| `search_memory` | `query`（必填）、`project?`、`type?`、`domain?`、`include_tentative?`、`limit?`（1-50，預設 10） | 依相關度排序的 `{id, title, trigger, lesson, type, project, domain, confidence, updated_at}` 陣列 | 解決問題前先查有沒有人踩過 |
+| `get_memory` | `id` | 完整 entry（含 evidence、`## Notes`）+ `path` | 已知 id，要看完整證據/備註 |
+| `list_domains` | `project?` | 依 domain / type / project 的 active memory 計數 | 查詢前先摸底有哪些 domain、哪些 project |
+| `memory_stats` | *(無)* | `byStatus`、`byType`、`sessions`、`lastProcessedAt`、`quarantineFiles` | 確認 store 健康狀況、distiller 有沒有在跑 |
+
+`search_memory` 的預設過濾是 **`status = active AND confidence >= 0.5`**
+（`query.ts` 呼叫 `index.search()` 時傳 `status: "active"`、
+`minConfidence: opts.include_tentative ? 0 : 0.5`）——這正是 distiller
+confidence 公式基準取 0.5 而非 0.4 的原因（見上方「Confidence 公式」）：預設
+情況下低於 0.5 的候選對 `search_memory` 完全不可見。傳 `include_tentative:
+true` 會把 `minConfidence` 降到 0，連剛蒸餾出來、還沒累積第二次證據的候選
+也會被搜到。`list_domains` 另外自己過濾 `status !== "active"` 跳過（不吃
+`include_tentative`），`memory_stats` 則是全表統計，不分 status。
+
+### 排序公式（bm25 rank-position boost 版）
+
+`query.ts: searchMemory` 的排序**不是**把 bm25 分數、confidence、recency
+三者直接相加。原因記在程式碼註解裡：SQLite 的 `bm25()` 分數在小型 store
+上量級常常小到 `~1e-6`，如果直接跟 confidence（0.1-0.95）、recency bonus
+相加，後兩項會直接主導排序結果，bm25 排出來的相關度順序反而形同虛設。
+
+實際作法：
+
+```
+score(i) = i - confidence - (recent ? 0.75 : 0)
+```
+
+- `i` 是 `index.search()` 回傳結果裡的**排名位置**（0-based，已經是 bm25
+  由好到壞排序後的名次），不是原始 bm25 分數本身。
+- `confidence` 直接減（越高的 confidence 讓 score 越小 → 排序越前面）。
+- `recent` 是「`updated_at` 落在 `now` 往前 30 天內」的布林值，命中再減
+  `0.75`。
+- 最後依 `score` 由小到大重排（`Array.sort`），再切 `limit`（預設 10，
+  上限 50）。
+
+效果：confidence 落在 `[0.1, 0.95]`、recency bonus 固定 `0.75`，兩者相加
+最多讓一筆結果的名次移動約 `0.95 + 0.75 ≈ 1.7` 個名次寬度——也就是
+confidence/recency 只能在「相鄰名次」之間做微調，**不能**讓排名第 10 的
+結果跳到第 1 名去蓋過真正 bm25 相關度更高的結果。這是 fix round 1 修正的
+版本；修正前的寫法是直接把 confidence/recency 加到原始 bm25 分數上，會被
+上述量級問題完全稀釋掉 bm25 排序。
+
+搜尋完成後，`search_memory` 對回傳的每一筆結果呼叫
+`index.recordAccess(id)`（`UPDATE memories SET access_count = access_count
++ 1, last_accessed = ?`），`get_memory` 同樣會對命中的單筆記錄 access——
+這是唯二會寫入 `index.db` 的路徑（見下方已知注意事項）。
+
+### 註冊方式
+
+- **opencode**（`~/.config/opencode/opencode.json` 或 per-project
+  `opencode.json`）：
+  ```json
+  {
+    "mcp": {
+      "agent-memory": {
+        "type": "local",
+        "command": ["bun", "/ABSOLUTE/PATH/TO/opencode-agent-memory/mcp-server/main.ts"]
+      }
+    }
+  }
+  ```
+  欄位形狀對照 `@opencode-ai/sdk` 的 `McpLocalConfig`：`type: "local"`、
+  `command: string[]`、可選 `environment`（例如覆寫 `AGENT_MEMORY_HOME`）。
+- **Claude Code**：`claude mcp add agent-memory -- bun
+  /ABSOLUTE/PATH/TO/opencode-agent-memory/mcp-server/main.ts`。
+- **probe（不需要任何 MCP host）**：`bun run mcp:probe "<query>"
+  [--project <slug>]` 呼叫 `search_memory`；`bun run mcp:probe --stats`
+  呼叫 `memory_stats`。內部用 `InMemoryTransport.createLinkedPair()` 接同
+  一支 `buildServer()`，跟正式 stdio 路徑共用全部邏輯，差別只在 transport。
+
+### 已知注意事項
+
+1. **`stdout` 是 MCP 協定通道，任何 log 都不能寫到 `stdout`。**
+   `main.ts` 唯一的一行狀態輸出用 `console.error(...)`（→ stderr），不是
+   `console.log`——MCP 的 JSON-RPC framing 就走 stdio 的 stdout，任何非
+   協定內容混進去都會讓 host 端解析失敗。`probe.ts` 反過來刻意用
+   `console.log` 印工具回傳的文字，因為 probe 走的是 in-memory
+   transport，不佔用真正的 stdio 通道，此時 stdout 就是給人看的輸出。
+2. **access 統計是 mcp-server 唯一的寫入路徑。** `search_memory` /
+   `get_memory` 呼叫 `index.recordAccess()` 更新
+   `memories.access_count` / `last_accessed`；除此之外 mcp-server 對
+   `store/` 底下任何檔案、任何其他資料表都是唯讀。這也是 spec §8 說
+   mcp-server 可以安全指向 git-synced 的 store 唯讀副本的原因——但要注意
+   `recordAccess()` 沒有包 try/catch，且是在 `searchMemory` 回傳結果**之
+   前**、對每個命中結果同步呼叫（`query.ts` 的 `for (const h of top)
+   index.recordAccess(...)` 迴圈跑完才 `return`）：如果指向的
+   `index.db` 真的是唯讀掛載，`recordAccess` 一丟例外，整個
+   `search_memory`/`get_memory` 呼叫會被 `server.ts` 的 `guarded()`
+   包成 `isError: true` 的失敗回應，即使查詢本身已經找到結果——不是「統計
+   悄悄漏記、結果照樣回傳」，而是連查詢結果都拿不到。這代表所謂「唯讀
+   副本」若要真的可用，`index.db` 檔案本身仍必須可寫。
+3. **`index.db` 併發靠 WAL + `busy_timeout`，不是額外的鎖機制。**
+   `MemoryIndex` 建構子開檔案就下 `PRAGMA journal_mode = WAL` +
+   `PRAGMA busy_timeout = 5000`（`distiller/ledger.ts`），mcp-server 和
+   distiller 的排程 `distill run` 是各自獨立的 process、各自開一個
+   `MemoryIndex` 實例指向同一個 `index.db`——WAL 模式讓讀者不擋寫者、寫者
+   不擋讀者，`busy_timeout` 則讓短暫的寫入鎖衝突改成等待 5 秒重試而不是
+   直接丟 `SQLITE_BUSY`。兩邊可以同時跑，不需要額外協調。
+4. **CJK 查詢受 FTS5 tokenizer 限制，跟 distiller 章節「已知陷阱補充」
+   第 2 條是同一個限制。** `memories_fts` 用預設 `unicode61` tokenizer，
+   不會對中文/日文斷詞，所以 `search_memory({ query: "中文關鍵字" })`
+   這類查詢的命中率會明顯比英文查詢差（一整段 CJK 字串會被當一個
+   token，query 端的 `ftsQuery()` 切詞規則也一樣適用於 mcp-server 的輸入，
+   因為兩邊共用 `MemoryIndex.search()`）。目前 lesson/trigger 預期以英文
+   為主，影響有限，但如果之後有人餵中文 query 進 `search_memory`，記得
+   這是已知限制，不是 bug。
+
 ## 文件對照表
 
 | 主題 | 路徑 |
@@ -318,4 +455,5 @@ Secret/高熵字串命中的候選不會被丟棄，而是寫成獨立檔案到
 | 蒸餾 pipeline 模式調研 | `docs/research/2026-07-10-distillation-pipeline-patterns.md` |
 | collector 手動驗證清單（headless + interactive 項目） | `docs/superpowers/VERIFY.md` |
 | distiller 手動驗證清單（headless + interactive 項目） | `docs/superpowers/VERIFY-distiller.md` |
-| Plan 1/2 逐 task 進度與遺留項目 ledger | `.superpowers/sdd/progress.md` |
+| mcp-server 手動驗證清單（headless + interactive 項目） | `docs/superpowers/VERIFY-mcp.md` |
+| Plan 1/2/3 逐 task 進度與遺留項目 ledger | `.superpowers/sdd/progress.md` |
