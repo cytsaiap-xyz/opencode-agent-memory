@@ -279,3 +279,25 @@ test("fresh db needs no rebuild", () => {
   expect(idx.ftsRebuildNeeded).toBe(false)
   idx.close()
 })
+
+test("LIKE fallback escapes underscore wildcard: '_' matches only literal underscore, not all", async () => {
+  const dir = tmp()
+  const idx = new MemoryIndex(join(dir, "index.db"))
+  // Two entries with NO underscores in any field
+  const e1 = entry("mem_no_underscore_1", { title: "Simple title", trigger: "simple trigger", lesson: "simple lesson", domain: ["simple"] })
+  const e2 = entry("mem_no_underscore_2", { title: "Another entry", trigger: "another trigger", lesson: "another lesson", domain: ["other"] })
+  // One entry with a literal underscore (snake_case word in lesson)
+  const e3 = entry("mem_with_underscore", { title: "Python patterns", lesson: "Use snake_case for variable names", domain: ["python"] })
+  for (const e of [e1, e2, e3]) idx.upsertEntry(e, await writeEntry(join(dir, "store"), e))
+
+  // Search for "_" should return ONLY e3 (the one with literal underscore), not all three
+  const hitsUnderscore = idx.search("_")
+  expect(hitsUnderscore.length).toBe(1)
+  expect(hitsUnderscore[0]!.entry.id).toBe("mem_with_underscore")
+
+  // Search for "__" (double underscore) should return zero hits (no entry has __ literally)
+  const hitsDoubleUnderscore = idx.search("__")
+  expect(hitsDoubleUnderscore.length).toBe(0)
+
+  idx.close()
+})

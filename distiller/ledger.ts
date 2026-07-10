@@ -142,11 +142,12 @@ export class MemoryIndex {
       return hits
     } else if (shortTokens.length > 0) {
       // LIKE fallback: per-token, per-column OR-joined
+      // Escape LIKE metacharacters (% and _) in each token before wrapping
       const likeCondParts: string[] = []
       const likeParams: (string | number)[] = []
       for (const tok of shortTokens) {
-        const pattern = `%${tok}%`
-        likeCondParts.push("(f.title LIKE ? OR f.trigger LIKE ? OR f.lesson LIKE ? OR f.domain LIKE ?)")
+        const pattern = "%" + tok.replace(/[\\%_]/g, "\\$&") + "%"
+        likeCondParts.push("(f.title LIKE ? ESCAPE '\\' OR f.trigger LIKE ? ESCAPE '\\' OR f.lesson LIKE ? ESCAPE '\\' OR f.domain LIKE ? ESCAPE '\\')")
         likeParams.push(pattern, pattern, pattern, pattern)
       }
       const likeCond = likeCondParts.join(" OR ")
