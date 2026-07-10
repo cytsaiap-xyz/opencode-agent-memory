@@ -7,7 +7,9 @@
     "build": "bun build collector/plugin-entry.ts --outfile dist/agent-memory-collector.js --target bun --format esm",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "distill": "bun distiller/cli.ts"
+    "distill": "bun distiller/cli.ts",
+    "mcp": "bun mcp-server/main.ts",
+    "mcp:probe": "bun mcp-server/probe.ts"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "1.17.9",
