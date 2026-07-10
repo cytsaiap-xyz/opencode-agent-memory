@@ -38,7 +38,31 @@ salience gating and sensible lessons.
 **Decision: PROCEED.** Architecture route C (markdown + SQLite FTS5, TS+Bun,
 single-binary deploys) is confirmed feasible end-to-end on real data.
 
-**Open items deferred to spec/plan:**
+## Spike B: MCP SDK shape check (2026-07-10, pre-Plan-3)
+
+**Question:** Does `@modelcontextprotocol/sdk` work under Bun with the shapes we
+need (tool registration, zod input schemas, in-memory test transport)?
+
+**Method:** scratchpad project, `bun add @modelcontextprotocol/sdk` (resolved
+1.29.0, pulls zod 4.4.3 as dependency, peer range `^3.25 || ^4.0`). Minimal
+`McpServer` + `registerTool("search_memory", { description, inputSchema: <zod
+raw shape> }, handler)` + `InMemoryTransport.createLinkedPair()` + `Client`.
+
+**Result: PASS.**
+- `client.listTools()` returns the registered tool.
+- `client.callTool({ name, arguments })` routes to the handler; handler returns
+  `{ content: [{ type: "text", text }] }`.
+- Invalid arguments (wrong type) are rejected AT THE SDK LAYER and come back as
+  `MCP error -32602` inside an error content payload — the handler never runs.
+  No manual validation needed for arg shapes (still validate semantics).
+- `InMemoryTransport` + `Client` = clean in-process integration testing, no
+  stdio spawning needed in unit tests.
+
+**Decision: PROCEED** with `@modelcontextprotocol/sdk` (pin exact 1.29.0) +
+`zod` (pin exact, declare directly since we import it). First runtime
+dependencies in the repo — justified by spec §8.
+
+**Open items deferred to spec/plan (Spike A):**
 - Evidence anchor format: keep `{#msg_id}` heading anchors (validated here).
 - Salience threshold 6 worked on first try; make it configurable.
 - `opencode run` as extraction backend is the dev-machine fallback; production
