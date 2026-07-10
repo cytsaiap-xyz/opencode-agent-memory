@@ -11,9 +11,17 @@ const MEMORY_CLASSES: readonly MemoryClass[] = ["episodic", "semantic", "procedu
 const STATUSES: readonly MemoryStatus[] = ["candidate", "active", "superseded", "quarantined", "archived"]
 const REVIEWS: readonly ReviewState[] = ["auto", "human_pending", "human_approved"]
 
+// Strings that would be sniffed as a JSON scalar by parseValue (leading digit / "-digit",
+// or an exact true/false/null) must be quoted even though they're otherwise raw-safe,
+// or they'd come back as a number/boolean/null instead of a string.
+const LOOKS_LIKE_JSON_SCALAR = /^-?\d|^(?:true|false|null)$/
+
 const enc = (v: unknown): string => {
   if (v === null) return "null"
-  if (typeof v === "string") return RAW_SAFE.test(v) ? v : JSON.stringify(v)
+  if (typeof v === "string") {
+    if (!RAW_SAFE.test(v) || LOOKS_LIKE_JSON_SCALAR.test(v)) return JSON.stringify(v)
+    return v
+  }
   if (typeof v === "boolean" || typeof v === "number") return String(v)
   return JSON.stringify(v)
 }
@@ -40,7 +48,7 @@ export function serializeEntry(e: MemoryEntry): string {
     `updated_at: ${enc(e.updated_at)}`,
     "---",
     "",
-    e.lesson,
+    e.lesson.trim(), // lesson is stored trimmed (parseEntry trims symmetrically)
   ]
   if (e.notes.length > 0) fm.push("", "## Notes", "", ...e.notes.map((n) => `- ${enc(n)}`))
   return fm.join("\n") + "\n"
@@ -82,10 +90,14 @@ export function parseEntry(markdown: string): MemoryEntry {
   }
 
   const body = markdown.slice(m[0]!.length)
-  const notesSplit = body.split(/\n## Notes\n/)
-  const lesson = notesSplit[0]!.trim()
+  // Only treat "## Notes" as a real notes section when it's shaped exactly as the
+  // serializer writes it: anchored at the end of the body and consisting solely of a
+  // trailing bullet list. Anything else (e.g. "## Notes" appearing mid-lesson) is left
+  // as part of the lesson instead of being silently truncated/misfiled.
+  const notesMatch = body.match(/\n\n## Notes\n\n((?:- [^\n]*\n?)+)$/)
+  const lesson = (notesMatch ? body.slice(0, notesMatch.index) : body).trim()
   if (!lesson) throw new Error("memory entry: empty lesson body")
-  const notes = (notesSplit[1] ?? "")
+  const notes = (notesMatch ? notesMatch[1]! : "")
     .split("\n")
     .filter((l) => l.startsWith("- "))
     .map((l) => parseValue(l.slice(2)) as string)

@@ -39,8 +39,29 @@ test("serialize/parse round-trips every field exactly", () => {
     entry({ notes: ["2026-07-11: confirmed on chip-beta (ses_y)", "second note"] }),
     entry({ title: 'tricky: "quotes" #hash \n newline', superseded_by: "mem_x", status: "superseded" }),
     entry({ scope: "global", project: "global", domain: ["a"] }),
+    // defect 1: a "## Notes" heading mid-lesson with no trailing bullets is not a real
+    // notes section, so it must stay part of the lesson verbatim.
+    entry({ lesson: "Header line\n## Notes\nstill lesson text here", notes: [] }),
+    // defect 1: "\n## Notes\n" can also appear mid-lesson while a *real* notes section
+    // (anchored bullets at the end) still exists — both must parse correctly.
+    entry({
+      lesson:
+        "Intro text.\n## Notes\nThis part is still lesson, not notes, since no bullets follow immediately after it.",
+      notes: ["note one"],
+    }),
+    // defect 2: a raw-safe string that would be sniffed as a JSON scalar by the parser
+    // (all-digits, leading "-digit", or true/false/null) must still round-trip as a string.
+    entry({ title: "123" }),
+    entry({ title: "true" }),
+    entry({ trigger: "-42" }),
   ]
   for (const e of entries) expect(parseEntry(serializeEntry(e))).toEqual(e)
+})
+
+test("defect 3: lesson whitespace is normalized (trimmed) on both write and read", () => {
+  const e = entry({ lesson: "  padded  " })
+  const parsed = parseEntry(serializeEntry(e))
+  expect(parsed.lesson).toBe("padded")
 })
 
 test("parseEntry throws descriptively on missing field", () => {
