@@ -9,6 +9,10 @@ if (import.meta.main) {
   const cfg = loadConfig()
   mkdirSync(cfg.storeDir, { recursive: true })
   const index = new MemoryIndex(join(cfg.storeDir, "index.db"))
+  if (index.ftsRebuildNeeded) {
+    console.error(`agent-memory: fts schema upgraded — rebuilding index from ${cfg.storeDir}`)
+    await index.rebuildFrom(cfg.storeDir)
+  }
   const server = buildServer({ index, storeDir: cfg.storeDir })
   const shutdown = () => {
     index.close()

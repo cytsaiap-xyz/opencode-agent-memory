@@ -9,6 +9,17 @@ export interface CliDeps { llm?: LlmClient; out?: (line: string) => void; err?: 
 
 const USAGE = "usage: distiller <run [--project <slug>] | reindex | review | stats>"
 
+async function openIndex(cfg: { storeDir: string }, onError?: (msg: string) => void): Promise<MemoryIndex> {
+  const index = new MemoryIndex(join(cfg.storeDir, "index.db"))
+  if (index.ftsRebuildNeeded) {
+    const msg = `agent-memory: fts schema upgraded — rebuilding index from ${cfg.storeDir}`
+    if (onError) onError(msg)
+    else console.error(msg)
+    await index.rebuildFrom(cfg.storeDir)
+  }
+  return index
+}
+
 const numEnv = (
   env: Record<string, string | undefined>, key: string, fallback: number,
   check: (n: number) => boolean,
@@ -37,7 +48,7 @@ export async function runCli(
         if (pi >= 0 && !project) throw new Error("--project needs a value")
         const llm = deps.llm ?? clientFromEnv(env)
         mkdirSync(cfg.storeDir, { recursive: true })
-        const index = new MemoryIndex(join(cfg.storeDir, "index.db"))
+        const index = await openIndex(cfg, err)
         try {
           const s = await runPipeline(cfg, { llm, index }, { project, idleHours, salienceMin })
           out(
@@ -52,7 +63,7 @@ export async function runCli(
       }
       case "reindex": {
         mkdirSync(cfg.storeDir, { recursive: true })
-        const index = new MemoryIndex(join(cfg.storeDir, "index.db"))
+        const index = await openIndex(cfg, err)
         try {
           out(`reindexed ${await index.rebuildFrom(cfg.storeDir)} memories`)
           return 0
@@ -62,7 +73,7 @@ export async function runCli(
       }
       case "review": {
         mkdirSync(cfg.storeDir, { recursive: true })
-        const index = new MemoryIndex(join(cfg.storeDir, "index.db"))
+        const index = await openIndex(cfg, err)
         try {
           const { listEntryPaths, readEntry } = await import("./store")
           const { readdirSync } = await import("node:fs")
@@ -111,7 +122,7 @@ export async function runCli(
       }
       case "stats": {
         mkdirSync(cfg.storeDir, { recursive: true })
-        const index = new MemoryIndex(join(cfg.storeDir, "index.db"))
+        const index = await openIndex(cfg, err)
         try {
           const s = index.stats()
           out(`memories: ${JSON.stringify(s.byStatus)}; types: ${JSON.stringify(s.byType)}; sessions processed: ${s.sessions}`)

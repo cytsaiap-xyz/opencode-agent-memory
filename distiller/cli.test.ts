@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { runCli } from "./cli"
 import type { LlmClient } from "./llm"
+import type { MemoryEntry } from "./types"
 
 const setup = () => {
   const dir = mkdtempSync(join(tmpdir(), "amem-cli-"))
@@ -87,7 +88,7 @@ test("review skips corrupt entry files instead of hiding or failing", async () =
   // Create a valid quarantined entry
   mkdirSync(join(dir, "store", "quarantine"), { recursive: true })
   const { serializeEntry } = await import("./store")
-  const validQuarantined: any = {
+  const validQuarantined: MemoryEntry = {
     id: "mem_q1",
     memory_class: "semantic",
     type: "know_how",
@@ -100,6 +101,7 @@ test("review skips corrupt entry files instead of hiding or failing", async () =
     confidence: 0.8,
     status: "quarantined",
     superseded_by: null,
+    supersedes: null,
     review: "human_pending",
     evidence: [{ session: "ses_1", anchors: ["msg_u1"], observed_at: "2026-07-10T00:00:00.000Z" }],
     provenance: { extractor: "test", prompt_hash: "h1" },
@@ -131,4 +133,71 @@ test("review skips corrupt entry files instead of hiding or failing", async () =
   // Should emit warnings for corrupt files
   expect(errText).toContain("quarantine/aaa_bad.md")
   expect(errText).toContain("memories/proja/bad.md")
+})
+
+test("v1-schema index is auto-rebuilt on first access with rebuild notice on stderr", async () => {
+  const { dir, env, out, err, deps } = setup()
+
+  // Create v1-schema database manually
+  mkdirSync(join(dir, "store", "memories", "proja"), { recursive: true })
+  const dbPath = join(dir, "store", "index.db")
+  const oldDb = new (await import("bun:sqlite")).Database(dbPath, { create: true })
+  const oldDDL = `
+    CREATE TABLE IF NOT EXISTS processed_sessions (
+      session_id TEXT NOT NULL, content_hash TEXT NOT NULL, pipeline_version TEXT NOT NULL,
+      extractor_model TEXT NOT NULL, processed_at TEXT NOT NULL,
+      n_candidates INTEGER NOT NULL, n_committed INTEGER NOT NULL,
+      PRIMARY KEY (session_id, content_hash, pipeline_version)
+    );
+    CREATE TABLE IF NOT EXISTS memories (
+      id TEXT PRIMARY KEY, project TEXT NOT NULL, type TEXT NOT NULL, status TEXT NOT NULL,
+      confidence REAL NOT NULL, volatile INTEGER NOT NULL, path TEXT NOT NULL,
+      updated_at TEXT NOT NULL, access_count INTEGER NOT NULL DEFAULT 0, last_accessed TEXT
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, title, trigger, lesson, domain);
+  `
+  oldDb.run(oldDDL)
+  // Insert a dummy entry
+  oldDb.run(`INSERT INTO memories (id, project, type, status, confidence, volatile, path, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ["mem_1", "proja", "pitfall", "active", 0.5, 0, join(dir, "store", "memories", "proja", "mem_1.md"), "2026-07-10T00:00:00.000Z"])
+  // Don't set user_version (v0/v1 database)
+  oldDb.close()
+
+  // Write a valid entry to the store so rebuild can index it
+  const { serializeEntry } = await import("./store")
+  const entry1: MemoryEntry = {
+    id: "mem_1",
+    memory_class: "semantic",
+    type: "pitfall",
+    title: "Rebuild Test",
+    trigger: "when testing",
+    project: "proja",
+    scope: "project",
+    domain: ["testing"],
+    volatile: false,
+    confidence: 0.5,
+    status: "active",
+    superseded_by: null,
+    supersedes: null,
+    review: "auto",
+    evidence: [{ session: "ses_1", anchors: ["msg_u1"], observed_at: "2026-07-10T00:00:00.000Z" }],
+    provenance: { extractor: "test", prompt_hash: "h1" },
+    created_at: "2026-07-10T00:00:00.000Z",
+    updated_at: "2026-07-10T00:00:00.000Z",
+    lesson: "Test entry for rebuild.",
+    notes: [],
+  }
+  writeFileSync(join(dir, "store", "memories", "proja", "mem_1.md"), serializeEntry(entry1))
+
+  // Run stats — should trigger rebuild
+  expect(await runCli(["stats"], env, deps)).toBe(0)
+
+  // Check output
+  const outText = out.join("\n")
+  const errText = err.join("\n")
+
+  // Stats should show the entry
+  expect(outText).toContain('"active":1')
+  // stderr should contain the rebuild notice
+  expect(errText).toContain("rebuilding index")
 })
