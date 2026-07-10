@@ -41,6 +41,7 @@ export function serializeEntry(e: MemoryEntry): string {
     `confidence: ${e.confidence}`,
     `status: ${enc(e.status)}`,
     `superseded_by: ${enc(e.superseded_by)}`,
+    `supersedes: ${enc(e.supersedes)}`,
     `review: ${enc(e.review)}`,
     `evidence: ${JSON.stringify(e.evidence)}`,
     `provenance: ${JSON.stringify(e.provenance)}`,
@@ -118,6 +119,9 @@ export function parseEntry(markdown: string): MemoryEntry {
   const supersededBy = req("superseded_by")
   if (supersededBy !== null && typeof supersededBy !== "string")
     throw new Error(`memory entry: field "superseded_by" must be string or null`)
+  const supersedes = fields.has("supersedes") ? fields.get("supersedes") : null
+  if (supersedes !== null && typeof supersedes !== "string")
+    throw new Error(`memory entry: field "supersedes" must be string or null`)
   const scope = oneOf("scope", ["project", "global"] as const)
 
   return {
@@ -133,6 +137,7 @@ export function parseEntry(markdown: string): MemoryEntry {
     confidence,
     status: oneOf("status", STATUSES),
     superseded_by: supersededBy,
+    supersedes,
     review: oneOf("review", REVIEWS),
     evidence: evidence as EvidenceRef[],
     provenance: { extractor: provenance.extractor, prompt_hash: provenance.prompt_hash },

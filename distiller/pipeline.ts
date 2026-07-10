@@ -29,7 +29,7 @@ function quarantineEntry(c: Candidate, meta: TranscriptMeta, now: Date, extracto
     type: c.type, title: c.title, trigger: c.trigger,
     project: meta.project, scope: "project", domain: c.domain, volatile: c.volatile,
     confidence: computeConfidence({ sessions: 1, humanApproved: false, contradicted: false }),
-    status: "quarantined", superseded_by: null, review: "human_pending",
+    status: "quarantined", superseded_by: null, supersedes: null, review: "human_pending",
     evidence: [{ session: meta.sessionId, anchors: c.evidence.map((e) => e.message_id), observed_at: meta.timeEnd }],
     provenance: { extractor, prompt_hash: promptHash },
     created_at: nowIso, updated_at: nowIso, lesson: c.lesson, notes: [],

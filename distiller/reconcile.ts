@@ -73,6 +73,7 @@ function entryFromCandidate(c: Candidate, meta: TranscriptMeta, deps: ReconcileD
     confidence: computeConfidence({ sessions: 1, humanApproved: false, contradicted: false }),
     status: "active",
     superseded_by: null,
+    supersedes: null,
     review: "auto",
     evidence: [{ session: meta.sessionId, anchors: c.evidence.map((e) => e.message_id), observed_at: meta.timeEnd }],
     provenance: { extractor: deps.extractorLabel, prompt_hash: deps.promptHash },

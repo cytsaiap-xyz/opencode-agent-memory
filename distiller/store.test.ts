@@ -23,6 +23,7 @@ const entry = (over: Partial<MemoryEntry> = {}): MemoryEntry => ({
   confidence: 0.5,
   status: "active",
   superseded_by: null,
+  supersedes: null,
   review: "auto",
   evidence: [{ session: "ses_x", anchors: ["msg_1", "msg_2"], observed_at: "2026-07-10T00:00:00.000Z" }],
   provenance: { extractor: "distiller v0.1 / fake", prompt_hash: "sha256:aa" },
@@ -54,6 +55,7 @@ test("serialize/parse round-trips every field exactly", () => {
     entry({ title: "123" }),
     entry({ title: "true" }),
     entry({ trigger: "-42" }),
+    entry({ supersedes: "mem_target" }),
   ]
   for (const e of entries) expect(parseEntry(serializeEntry(e))).toEqual(e)
 })
@@ -92,6 +94,19 @@ test("write/read/list round-trip on disk; global scope path", async () => {
   expect(await readEntry(p1)).toEqual(e1)
   expect(listEntryPaths(dir).sort()).toEqual([p1, p2].sort())
   expect(entryPath(dir, e1)).toBe(p1)
+})
+
+test("parseEntry defaults missing supersedes to null (legacy files)", () => {
+  const serialized = serializeEntry(entry())
+  const legacy = serialized.replace(/^supersedes: .*$/m, "")
+  const parsed = parseEntry(legacy)
+  expect(parsed.supersedes).toBe(null)
+  expect(parsed).toEqual({ ...entry(), supersedes: null })
+})
+
+test("parseEntry rejects wrong-typed supersedes", () => {
+  const bad = serializeEntry(entry()).replace(/^supersedes: .*$/m, "supersedes: 42")
+  expect(() => parseEntry(bad)).toThrow(/supersedes/)
 })
 
 test("computeConfidence follows the spec formula with clamping", () => {

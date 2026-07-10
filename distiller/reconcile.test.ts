@@ -29,7 +29,7 @@ const existing = (id: string, over: Partial<MemoryEntry> = {}): MemoryEntry => (
   id, memory_class: "semantic", type: "pitfall",
   title: "SPEF reuse after ECO", trigger: "after ECO route",
   project: "proja", scope: "project", domain: ["sta"],
-  volatile: false, confidence: 0.5, status: "active", superseded_by: null, review: "auto",
+  volatile: false, confidence: 0.5, status: "active", superseded_by: null, supersedes: null, review: "auto",
   evidence: [{ session: "ses_1", anchors: ["msg_a"], observed_at: "2026-07-10T00:00:00.000Z" }],
   provenance: { extractor: "t", prompt_hash: "sha256:aa" },
   created_at: "2026-07-10T00:00:00.000Z", updated_at: "2026-07-10T00:00:00.000Z",
