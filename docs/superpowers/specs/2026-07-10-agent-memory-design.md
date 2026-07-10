@@ -156,8 +156,11 @@ Stages per transcript (session = unit of work):
    catalog grouped by type × domain, MEMORY.md-index style).
 
 Confidence is deterministic, not LLM-rated:
-`0.4 + 0.15·(independent_sessions−1) + 0.2·human_approved − 0.2·contradicted`,
-clamped [0.1, 0.95]. Scope: `project` by default; REFLECT-style promotion to
+`0.5 + 0.15·(independent_sessions−1) + 0.2·human_approved − 0.25·contradicted`,
+clamped [0.1, 0.95]. (Base 0.5, not 0.4: extractions already passed the salience
+gate, and a 0.4 base would leave every single-session memory below the MCP
+default serve threshold of 0.5 — an invisible store on day one. Amended
+2026-07-10 during Plan 2 design.) Scope: `project` by default; REFLECT-style promotion to
 `global/` when the same lesson accrues evidence from ≥ 2 projects (phase-1
 implementation: reconciler detects cross-project UPDATE and flags for promotion).
 
