@@ -1,12 +1,13 @@
 import { mkdir } from "node:fs/promises"
-import { existsSync, readdirSync } from "node:fs"
-import { dirname, join } from "node:path"
+import { readdirSync } from "node:fs"
+import { join } from "node:path"
 import type { MemoryConfig } from "../shared/config"
 import { buildExtractPrompt, EXTRACT_SCHEMA, validateCandidates, type Candidate } from "./extract"
 import type { LlmClient } from "./llm"
 import type { MemoryIndex } from "./ledger"
+import { writeQuarantineEntry } from "./quarantine"
 import { reconcileCandidate } from "./reconcile"
-import { computeConfidence, entryId, listEntryPaths, quarantinePath, readEntry, serializeEntry } from "./store"
+import { computeConfidence, entryId, listEntryPaths, readEntry } from "./store"
 import { isEligible, scanSpool, type TranscriptMeta } from "./transcripts"
 import type { MemoryEntry } from "./types"
 
@@ -83,27 +84,7 @@ export async function runPipeline(
       for (const sec of validated.secrets) {
         const qe = quarantineEntry(sec.item, meta, now, extractor, promptHash)
         qe.notes.push(`${now.toISOString().slice(0, 10)}: quarantined — secret scan: ${sec.matches.join(", ")}`)
-        let qPath = quarantinePath(cfg.storeDir, qe.id)
-        // Uniquify if the file already exists OR the id is already claimed in the index
-        // (e.g. by an active memory) — entryId is deterministic on project+title+day, so a
-        // same-project/title/day secret candidate can otherwise carry the SAME id as an
-        // existing active row; upsertEntry would then repoint that active row's path to the
-        // quarantine file, making the active memory vanish from search. Matches addEntry's
-        // uniquify convention in reconcile.ts.
-        if (existsSync(qPath) || deps.index.getById(qe.id) !== null) {
-          let suffix = 2
-          while (
-            existsSync(quarantinePath(cfg.storeDir, `${qe.id}-${suffix}`)) ||
-            deps.index.getById(`${qe.id}-${suffix}`) !== null
-          ) {
-            suffix++
-          }
-          qe.id = `${qe.id}-${suffix}`
-          qPath = quarantinePath(cfg.storeDir, qe.id)
-        }
-        await mkdir(dirname(qPath), { recursive: true })
-        await Bun.write(qPath, serializeEntry(qe))
-        deps.index.upsertEntry(qe, qPath)
+        await writeQuarantineEntry(cfg.storeDir, deps.index, qe)
         summary.quarantined++
       }
 
@@ -115,6 +96,7 @@ export async function runPipeline(
         if (r.op === "ADD") { summary.ops.added++; committed++ }
         else if (r.op === "UPDATE") { summary.ops.updated++; committed++ }
         else if (r.op === "SUPERSEDE") { summary.ops.superseded++; committed++ }
+        else if (r.op === "SUPERSEDE_PENDING") { summary.quarantined++ }
         else summary.ops.nooped++
       }
 

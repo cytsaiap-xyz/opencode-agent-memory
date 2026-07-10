@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { LlmClient } from "./llm"
@@ -113,6 +113,64 @@ test("SUPERSEDE creates new entry and tombstones the old one", async () => {
   const active = index.search("SPEF", { status: "active" })
   expect(active.length).toBe(1)
   expect(active[0]!.entry.lesson).toBe("New corrected advice.")
+})
+
+test("SUPERSEDE against decision-type target is intercepted into review queue", async () => {
+  const seed = existing("mem_20260710_aaaaaa", {
+    type: "decision", title: "Ban useful-skew", trigger: "clock tree", lesson: "Never use useful skew.",
+  })
+  const { storeDir, index } = await setup(seed)
+  const before = await readEntry(entryPath(storeDir, seed))
+  const r = await reconcileCandidate(
+    cand({ type: "decision", title: "Ban useful-skew", trigger: "clock tree", lesson: "Useful skew is now allowed." }),
+    meta,
+    deps({
+      llm: fakeLlm('{"op":"SUPERSEDE","target_id":"mem_20260710_aaaaaa","reason":"process improved"}'),
+      index, storeDir,
+    }),
+  )
+  expect(r.op).toBe("SUPERSEDE_PENDING")
+  expect(r.entry).toBeDefined()
+
+  // Target untouched: still active, not superseded, file unchanged.
+  const target = index.getById("mem_20260710_aaaaaa")!
+  expect(target.entry.status).toBe("active")
+  expect(target.entry.superseded_by).toBeNull()
+  const after = await readEntry(entryPath(storeDir, seed))
+  expect(after).toEqual(before)
+
+  // A quarantine entry exists carrying the pending-review shape.
+  const qHit = index.getById(r.entry!.id)!
+  expect(qHit.entry.status).toBe("quarantined")
+  expect(qHit.entry.review).toBe("human_pending")
+  expect(qHit.entry.supersedes).toBe("mem_20260710_aaaaaa")
+  expect(qHit.entry.notes.some((n) => n.includes("pending review"))).toBe(true)
+  expect(existsSync(qHit.path)).toBe(true)
+  expect(qHit.path).toContain("quarantine")
+})
+
+test("SUPERSEDE against convention-type target is intercepted into review queue", async () => {
+  const seed = existing("mem_20260710_aaaaaa", {
+    type: "convention", title: "Naming convention", trigger: "new module", lesson: "Prefix modules with mod_.",
+  })
+  const { storeDir, index } = await setup(seed)
+  const r = await reconcileCandidate(
+    cand({ type: "convention", title: "Naming convention", trigger: "new module", lesson: "Prefix modules with m_." }),
+    meta,
+    deps({
+      llm: fakeLlm('{"op":"SUPERSEDE","target_id":"mem_20260710_aaaaaa","reason":"style changed"}'),
+      index, storeDir,
+    }),
+  )
+  expect(r.op).toBe("SUPERSEDE_PENDING")
+  const target = index.getById("mem_20260710_aaaaaa")!
+  expect(target.entry.status).toBe("active")
+  expect(target.entry.superseded_by).toBeNull()
+  const qHit = index.getById(r.entry!.id)!
+  expect(qHit.entry.status).toBe("quarantined")
+  expect(qHit.entry.review).toBe("human_pending")
+  expect(qHit.entry.supersedes).toBe("mem_20260710_aaaaaa")
+  expect(qHit.entry.notes.some((n) => n.includes("pending review"))).toBe(true)
 })
 
 test("NOOP writes nothing", async () => {

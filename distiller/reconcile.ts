@@ -2,6 +2,7 @@ import type { Candidate } from "./extract"
 import { stripFences } from "./extract"
 import type { LlmClient } from "./llm"
 import type { MemoryIndex } from "./ledger"
+import { writeQuarantineEntry } from "./quarantine"
 import { computeConfidence, entryId, writeEntry } from "./store"
 import type { TranscriptMeta } from "./transcripts"
 import type { MemoryEntry } from "./types"
@@ -153,7 +154,7 @@ async function addEntry(
 
 export async function reconcileCandidate(
   c: Candidate, meta: TranscriptMeta, deps: ReconcileDeps,
-): Promise<{ op: ReconcileOp["op"]; entry?: MemoryEntry }> {
+): Promise<{ op: ReconcileOp["op"] | "SUPERSEDE_PENDING"; entry?: MemoryEntry }> {
   const neighbors = deps.index.search(`${c.title} ${c.lesson}`, { status: "active", limit: 5 })
   let decision: ReconcileOp
   if (neighbors.length === 0) {
@@ -178,6 +179,23 @@ export async function reconcileCandidate(
     }
     case "SUPERSEDE": {
       const target = neighbors.find((h) => h.entry.id === decision.target_id)!
+      // decision/convention memories represent deliberate human calls (banned patterns,
+      // team conventions) — an automatic SUPERSEDE could silently flip a rule the LLM
+      // misjudged as outdated. Route these into the quarantine review queue instead of
+      // auto-applying; the target is left completely untouched pending human approval.
+      if (target.entry.type === "decision" || target.entry.type === "convention") {
+        const pending: MemoryEntry = {
+          ...entryFromCandidate(c, meta, deps),
+          status: "quarantined",
+          review: "human_pending",
+          supersedes: decision.target_id,
+        }
+        pending.notes.push(
+          `${deps.now.toISOString().slice(0, 10)}: pending review — proposes to supersede ${decision.target_id}: ${decision.reason}`,
+        )
+        const entry = await writeQuarantineEntry(deps.storeDir, deps.index, pending)
+        return { op: "SUPERSEDE_PENDING", entry }
+      }
       const added = await addEntry(c, meta, deps)
       // addEntry degraded to UPDATE (the candidate's computed id collided with an active
       // entry — normally the target itself, since it came from these same active
