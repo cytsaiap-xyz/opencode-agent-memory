@@ -151,7 +151,10 @@ Stages per transcript (session = unit of work):
    `superseded_by: <id>` — never delete.
 6. **COMMIT** — write/update memory markdown files; append ledger row; entries
    with confidence < auto-threshold or type ∈ {decision, convention} conflicts →
-   `quarantine/` for human review.
+   `quarantine/` for human review. (phase 1: secrets-only; low-confidence and
+   decision/convention conflict gating deferred to plan 3 review flow — the
+   current implementation only routes VALIDATE's secret-scan hits to
+   `quarantine/`, not confidence or type-conflict gating.)
 7. **PUBLISH** — refresh FTS index; regenerate `store/INDEX.md` (human-readable
    catalog grouped by type × domain, MEMORY.md-index style).
 

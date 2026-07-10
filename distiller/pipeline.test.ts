@@ -5,7 +5,9 @@ import { join } from "node:path"
 import { loadConfig } from "../shared/config"
 import type { LlmClient } from "./llm"
 import { MemoryIndex } from "./ledger"
-import { runPipeline } from "./pipeline"
+import { renderIndexMd, runPipeline } from "./pipeline"
+import { entryPath, quarantinePath, serializeEntry } from "./store"
+import type { MemoryEntry } from "./types"
 
 const PAD = "\n\npadding ".repeat(60) // pushes body length past the 400-char triage floor
 
@@ -145,6 +147,36 @@ test("quarantined entries render in INDEX.md under ## Quarantine section", async
   expect(indexMd).toContain("Key setup")
 })
 
+test("secret candidate colliding with an active memory's id does not hijack it", async () => {
+  const { cfg, index } = setup()
+  // Same title -> same deterministic entryId(project, title, day) for both runs.
+  const title = "Same Title"
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcript("ses_1", "sha256:h1", "clean topic"))
+  const s1 = await runPipeline(cfg, { llm: scriptedLlm([candidateJson(title, "Do the thing.")]), index }, { now: NOW })
+  expect(s1.ops.added).toBe(1)
+  const activeId = index.search(title, { status: "active" })[0]!.entry.id
+
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_2.md"), transcript("ses_2", "sha256:h2", "leaky topic"))
+  const s2 = await runPipeline(
+    cfg,
+    { llm: scriptedLlm([candidateJson(title, "Set AKIA0123456789ABCDEF first.")]), index },
+    { now: NOW },
+  )
+  expect(s2.quarantined).toBe(1)
+
+  // The active memory must still resolve via getById with status "active" and a path
+  // under memories/, not have been repointed at the quarantine file.
+  const activeHit = index.getById(activeId)
+  expect(activeHit).not.toBeNull()
+  expect(activeHit!.entry.status).toBe("active")
+  expect(activeHit!.path).toContain(`${join("memories", "proja")}`)
+
+  // The quarantine entry must exist under a uniquified (suffixed) id, not the same id.
+  const quarantineHit = index.search(title, { status: "quarantined" })[0]!
+  expect(quarantineHit.entry.id).not.toBe(activeId)
+  expect(existsSync(quarantineHit.path)).toBe(true)
+})
+
 test("colliding quarantine entries are uniquified with numeric suffixes", async () => {
   const { cfg, index } = setup()
   // Two sessions with same project and title but different content hashes
@@ -162,4 +194,29 @@ test("colliding quarantine entries are uniquified with numeric suffixes", async 
   expect(files.length).toBe(2)
   // Both files should exist
   expect(files.every((f) => f.endsWith(".md"))).toBe(true)
+})
+
+test("renderIndexMd dedupes a quarantined id that shows up under both memories/ and quarantine/", async () => {
+  const { cfg } = setup()
+  const q: MemoryEntry = {
+    id: "mem_20260711_dupdup", memory_class: "semantic", type: "pitfall",
+    title: "Duplicated Quarantine Entry", trigger: "when x", project: "proja", scope: "project",
+    domain: ["d"], volatile: false, confidence: 0.5, status: "quarantined", superseded_by: null,
+    review: "human_pending",
+    evidence: [{ session: "ses_1", anchors: ["msg_1"], observed_at: "2026-07-11T00:00:00.000Z" }],
+    provenance: { extractor: "t", prompt_hash: "sha256:aa" },
+    created_at: "2026-07-11T00:00:00.000Z", updated_at: "2026-07-11T00:00:00.000Z",
+    lesson: "lesson", notes: [],
+  }
+  // Same id present both under memories/ (stray/transitional state) and quarantine/
+  // (canonical location) — INDEX.md must still list it exactly once.
+  mkdirSync(join(cfg.storeDir, "memories", "proja"), { recursive: true })
+  mkdirSync(join(cfg.storeDir, "quarantine"), { recursive: true })
+  writeFileSync(entryPath(cfg.storeDir, q), serializeEntry(q))
+  writeFileSync(quarantinePath(cfg.storeDir, q.id), serializeEntry(q))
+
+  await renderIndexMd(cfg.storeDir)
+  const indexMd = readFileSync(join(cfg.storeDir, "INDEX.md"), "utf8")
+  const occurrences = indexMd.split("\n").filter((l) => l.includes(q.id)).length
+  expect(occurrences).toBe(1)
 })

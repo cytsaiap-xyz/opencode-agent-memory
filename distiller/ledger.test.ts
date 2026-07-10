@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test"
-import { mkdtempSync, readFileSync, statSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { MemoryIndex } from "./ledger"
-import { parseEntry, writeEntry } from "./store"
+import { parseEntry, quarantinePath, serializeEntry, writeEntry } from "./store"
 import type { MemoryEntry } from "./types"
 
 const tmp = () => mkdtempSync(join(tmpdir(), "amem-idx-"))
@@ -104,6 +104,42 @@ test("rebuildFrom does not modify markdown files", async () => {
 
   expect(statSync(p).mtimeMs).toBe(before)
   expect(parseEntry(readFileSync(p, "utf8"))).toEqual(e)
+  idx.close()
+})
+
+test("rebuildFrom skips a corrupt file and still indexes the valid ones", async () => {
+  const dir = tmp()
+  const store = join(dir, "store")
+  const idx = new MemoryIndex(join(dir, "index.db"))
+  mkdirSync(join(store, "memories", "chip-alpha"), { recursive: true })
+  const e1 = entry("mem_1")
+  const e3 = entry("mem_3")
+  await writeEntry(store, e1)
+  // mem_2 sorts between mem_1 and mem_3 in listEntryPaths' sorted order, so a naive
+  // implementation that throws mid-loop would abort before ever reaching mem_3.
+  writeFileSync(join(store, "memories", "chip-alpha", "mem_2.md"), "corrupt garbage no frontmatter")
+  await writeEntry(store, e3)
+
+  const n = await idx.rebuildFrom(store)
+  expect(n).toBe(2)
+  expect(idx.getById("mem_1")).not.toBeNull()
+  expect(idx.getById("mem_3")).not.toBeNull()
+  expect(idx.getById("mem_2")).toBeNull()
+  idx.close()
+})
+
+test("rebuildFrom also scans quarantine/*.md so quarantined rows survive reindex", async () => {
+  const dir = tmp()
+  const store = join(dir, "store")
+  const idx = new MemoryIndex(join(dir, "index.db"))
+  const q = entry("mem_q", { status: "quarantined", review: "human_pending" })
+  const qPath = quarantinePath(store, q.id)
+  mkdirSync(join(store, "quarantine"), { recursive: true })
+  writeFileSync(qPath, serializeEntry(q))
+
+  const n = await idx.rebuildFrom(store)
+  expect(n).toBe(1)
+  expect(idx.stats().byStatus.quarantined).toBe(1)
   idx.close()
 })
 

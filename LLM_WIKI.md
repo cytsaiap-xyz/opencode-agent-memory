@@ -281,16 +281,30 @@ Secret/高熵字串命中的候選不會被丟棄，而是寫成獨立檔案到
    }`；如果指向的 vLLM 沒有開 `--guided-decoding-backend`（或引擎不
    支援 guided JSON），請求可能直接失敗，或伺服器忽略
    `response_format`、回傳非結構化文字，導致下游 `JSON.parse` 炸掉。
-5. **`index.db` 可以隨時砍掉重建，但 `reindex` 不會恢復 quarantine
-   項目。** `bun run distill reindex` 呼叫 `ledger.ts: rebuildFrom`，
-   邏輯是清空 `memories`/`memories_fts` 兩張表，再用
-   `store.ts: listEntryPaths` 重新掃一次——而 `listEntryPaths` **只走
-   `store/memories/` 這棵樹**，不掃 `store/quarantine/`。也就是說，
-   正常 pipeline 產生的 quarantine 項目（寫在 `quarantine/` 目錄）在
-   `reindex` 之後不會出現在 `index.db` 的 `memories` 表裡——不過
-   `bun run distill review` 是直接讀 `quarantine/` 目錄本身、不依賴
-   index，所以審查功能不受影響，只有 `getById`/`search` 查得到
-   quarantine 項目這件事會受影響。
+5. **（已修，Plan 2 final wave）`reindex` 現在同時掃 `store/quarantine/`
+   ——但如果你只信任 `store.ts: listEntryPaths` 沒改就以為 quarantine
+   還是漏的，會白繞一圈。** `ledger.ts: rebuildFrom` 原本只清空
+   `memories`/`memories_fts` 兩張表再用 `listEntryPaths` 重新掃一次，
+   而 `listEntryPaths` **只走 `store/memories/` 這棵樹**，不掃
+   `store/quarantine/`，導致 `reindex` 之後 quarantine 項目從
+   `index.db` 的 `memories` 表消失（`getById`/`search` 查不到，
+   `bun run distill review` 因為直接讀目錄不受影響）。現在
+   `rebuildFrom` 額外 `readdirSync(quarantine/)` 把這批也塞回去，同時
+   遇到單一檔案 parse 失敗只 warn+跳過、不會中途整批 abort（見下一
+   條）。
+6. **`reindex` 重建的只有 memories + quarantine 這兩份資料的 FTS
+   索引，`processed_sessions`（冪等 ledger）和 access 統計都不在重建
+   範圍內；砍掉整個 `index.db` 檔案會連 ledger 一起清空。**
+   `ledger.ts: rebuildFrom` 只 `DELETE FROM memories` /
+   `memories_fts` 再從磁碟檔案重新灌回去——`processed_sessions`（`bun
+   run distill run` 的 `isProcessed`/`recordProcessed` 用來判斷「這個
+   session 是否已經處理過」）和 `memories.access_count` /
+   `last_accessed` 完全不會被重建，因為它們不是從 `store/memories/`
+   或 `store/quarantine/` 的 markdown 檔案衍生出來的，本來就沒有磁碟
+   上的真相來源可以回填。所以「`rm index.db` 再 `reindex`」只能恢復
+   memory 條目本身；下一次 `distill run` 會把每個 transcript session
+   當成沒處理過，重新跑一次完整的 LLM 抽取（`VERIFY-distiller.md`
+   item 4 曾經誤寫成兩者等價，已更正）。
 
 ## 文件對照表
 

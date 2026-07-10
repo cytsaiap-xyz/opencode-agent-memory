@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite"
-import { readFileSync } from "node:fs"
+import { readdirSync, readFileSync } from "node:fs"
+import { join } from "node:path"
 import { listEntryPaths, parseEntry } from "./store"
 import type { MemoryEntry } from "./types"
 import { PIPELINE_VERSION } from "./types"
@@ -143,11 +144,27 @@ export class MemoryIndex {
   async rebuildFrom(storeDir: string): Promise<number> {
     this.db.run(`DELETE FROM memories`)
     this.db.run(`DELETE FROM memories_fts`)
+    // Quarantined entries live under storeDir/quarantine, not storeDir/memories, and would
+    // otherwise be permanently dropped from the index by a reindex (rebuildFrom wipes the
+    // tables first, so anything not re-scanned here is simply gone).
+    const quarantineDir = join(storeDir, "quarantine")
+    let qPaths: string[] = []
+    try {
+      qPaths = readdirSync(quarantineDir).filter((f) => f.endsWith(".md")).map((f) => join(quarantineDir, f))
+    } catch {
+      // quarantine dir doesn't exist yet
+    }
     let count = 0
-    for (const path of listEntryPaths(storeDir)) {
-      const entry = parseEntry(await Bun.file(path).text())
-      this.upsertEntry(entry, path)
-      count++
+    for (const path of [...listEntryPaths(storeDir), ...qPaths]) {
+      try {
+        const entry = parseEntry(await Bun.file(path).text())
+        this.upsertEntry(entry, path)
+        count++
+      } catch (e) {
+        // One corrupt/unparseable file must not abort the whole rebuild after the tables
+        // have already been wiped — skip it, warn, and keep going; count only what parsed.
+        console.error(`ledger: rebuildFrom: skipping unparseable file ${path}: ${e instanceof Error ? e.message : String(e)}`)
+      }
     }
     return count
   }

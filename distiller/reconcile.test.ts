@@ -159,6 +159,22 @@ test("ADD collision with active existing entry degrades to UPDATE instead of ove
   expect(hits.length).toBe(1) // only one entry exists for this id, no duplicate written
 })
 
+test("UPDATE re-reconciling the same session again does not duplicate the note", async () => {
+  // Seed already carries evidence for the SAME session as the incoming candidate — this
+  // simulates a same-session re-extraction (e.g. a rerun) reconciling to UPDATE again.
+  const seed = existing("mem_20260710_aaaaaa", {
+    evidence: [{ session: "ses_2", anchors: ["msg_a"], observed_at: "2026-07-10T00:00:00.000Z" }],
+  })
+  const { storeDir, index } = await setup(seed)
+  const r = await reconcileCandidate(
+    cand(), meta,
+    deps({ llm: fakeLlm('{"op":"UPDATE","target_id":"mem_20260710_aaaaaa","note":"confirmed again"}'), index, storeDir }),
+  )
+  expect(r.op).toBe("UPDATE")
+  expect(r.entry!.evidence.length).toBe(1) // no new evidence added for an already-seen session
+  expect(r.entry!.notes.length).toBe(0) // and no duplicate note pushed
+})
+
 test("UPDATE target drifted out of the index (file deleted) falls back to ADD", async () => {
   const seed = existing("mem_20260710_aaaaaa")
   const { storeDir, index } = await setup(seed)

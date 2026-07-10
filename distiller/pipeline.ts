@@ -84,10 +84,18 @@ export async function runPipeline(
         const qe = quarantineEntry(sec.item, meta, now, extractor, promptHash)
         qe.notes.push(`${now.toISOString().slice(0, 10)}: quarantined — secret scan: ${sec.matches.join(", ")}`)
         let qPath = quarantinePath(cfg.storeDir, qe.id)
-        // Uniquify if file already exists
-        if (existsSync(qPath)) {
+        // Uniquify if the file already exists OR the id is already claimed in the index
+        // (e.g. by an active memory) — entryId is deterministic on project+title+day, so a
+        // same-project/title/day secret candidate can otherwise carry the SAME id as an
+        // existing active row; upsertEntry would then repoint that active row's path to the
+        // quarantine file, making the active memory vanish from search. Matches addEntry's
+        // uniquify convention in reconcile.ts.
+        if (existsSync(qPath) || deps.index.getById(qe.id) !== null) {
           let suffix = 2
-          while (existsSync(quarantinePath(cfg.storeDir, `${qe.id}-${suffix}`))) {
+          while (
+            existsSync(quarantinePath(cfg.storeDir, `${qe.id}-${suffix}`)) ||
+            deps.index.getById(`${qe.id}-${suffix}`) !== null
+          ) {
             suffix++
           }
           qe.id = `${qe.id}-${suffix}`
@@ -126,11 +134,13 @@ export async function runPipeline(
 
 export async function renderIndexMd(storeDir: string): Promise<void> {
   const byProject = new Map<string, MemoryEntry[]>()
-  const quarantined: MemoryEntry[] = []
+  // Keyed by id so an entry that (through some past bug or transitional state) shows up
+  // both under memories/ and quarantine/ is only listed once.
+  const quarantined = new Map<string, MemoryEntry>()
   for (const path of listEntryPaths(storeDir)) {
     try {
       const e = await readEntry(path)
-      if (e.status === "quarantined") quarantined.push(e)
+      if (e.status === "quarantined") quarantined.set(e.id, e)
       else if (e.status === "active" || e.status === "candidate") {
         const list = byProject.get(e.project) ?? []
         list.push(e)
@@ -151,7 +161,7 @@ export async function renderIndexMd(storeDir: string): Promise<void> {
   for (const path of qFiles) {
     try {
       const e = await readEntry(path)
-      quarantined.push(e)
+      quarantined.set(e.id, e)
     } catch {
       // unparseable entry: skip in index rendering
     }
@@ -163,9 +173,9 @@ export async function renderIndexMd(storeDir: string): Promise<void> {
       lines.push(`- [${e.title}](memories/${e.project}/${e.id}.md) — ${e.type}, confidence ${e.confidence}, ${e.status}`)
     lines.push("")
   }
-  if (quarantined.length > 0) {
+  if (quarantined.size > 0) {
     lines.push("## Quarantine", "")
-    for (const e of quarantined) lines.push(`- ${e.id}: ${e.title}`)
+    for (const e of quarantined.values()) lines.push(`- ${e.id}: ${e.title}`)
     lines.push("")
   }
   await mkdir(storeDir, { recursive: true })

@@ -93,9 +93,14 @@ async function applyUpdate(
   if (!hit || hit.entry.status !== "active") return null
   const target = hit.entry
   const day = deps.now.toISOString().slice(0, 10)
-  if (!target.evidence.some((ev) => ev.session === meta.sessionId))
+  // Evidence for this session already exists — this is a same-session re-extraction
+  // (e.g. a rerun that reconciles to UPDATE again), not new evidence. Only append the
+  // evidence + reconcile note the first time a given session is seen, or reruns duplicate
+  // notes on every pass.
+  if (!target.evidence.some((ev) => ev.session === meta.sessionId)) {
     target.evidence.push({ session: meta.sessionId, anchors: c.evidence.map((e) => e.message_id), observed_at: meta.timeEnd })
-  target.notes.push(`${day}: ${note} (${meta.sessionId})`)
+    target.notes.push(`${day}: ${note} (${meta.sessionId})`)
+  }
   if (target.project !== meta.project && target.scope === "project")
     target.notes.push(`${day}: promotion candidate: seen in ${meta.project}`)
   const sessions = new Set(target.evidence.map((ev) => ev.session)).size
