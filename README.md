@@ -186,7 +186,9 @@ INGEST → TRIAGE → EXTRACT → VALIDATE → RECONCILE → COMMIT → PUBLISH
 ```bash
 bun run distill run [--project <slug>]   # run the pipeline once
 bun run distill reindex                  # rebuild index.db from memories/ on disk
-bun run distill review                   # list quarantined entries needing human review
+bun run distill review                   # list ALL entries pending human review
+bun run distill approve <id>             # release a pending entry (see Review workflow below)
+bun run distill reject <id> [--reason "<text>"]  # archive a pending entry, never delete
 bun run distill stats                    # print counts by status/type + sessions processed
 ```
 
@@ -199,6 +201,70 @@ distill done: 3 added, 1 updated, 0 superseded, 2 nooped, 1 quarantined, 0 rejec
 Exit codes: `0` success, `1` bad usage/config (unknown command, missing
 `--project` value, invalid env value), `2` one or more transcripts errored
 during a `run` (the rest of the batch still completes).
+
+### Review workflow
+
+`distill review` lists every entry with `review: human_pending` and
+`status != archived` — both the `quarantine/` directory (secret-scan hits,
+and `SUPERSEDE_PENDING` entries, see below) and `memories/<project>/` (a
+human may have moved a file there by hand without flipping its `review`
+field yet). Each line is `<id> — <title> (<last note>)`; a corrupt file is
+skipped with a `skipping corrupt entry: <path>` warning on stderr instead of
+aborting the whole listing.
+
+**`distill approve <id>`** — releases the entry:
+1. Must currently be `review: human_pending` and `status != archived`
+   (anything else → friendly error, exit 1).
+2. Sets `status: active`, `review: human_approved`, recomputes confidence via
+   `computeConfidence({ sessions: <distinct evidence sessions>, humanApproved:
+   true, contradicted: false })` (this is the only place the `+0.2
+   human_approved` term in the confidence formula is ever triggered), appends
+   a dated `approved by human` note.
+3. If the file lives under `quarantine/`, moves it into
+   `memories/<project>/<id>.md`; on a destination collision the id is
+   uniquified with the existing `-2`/`-3` convention (the approved entry
+   moves under the new id; the file already occupying the destination is
+   never touched).
+4. If the entry has a `supersedes: <target_id>` field (see below), tombstones
+   the target now — `status: superseded`, `superseded_by: <the approved
+   entry's FINAL id, after any rename>` — unless the target has drifted out
+   of the index, in which case approval still succeeds with a
+   `supersede target <id> not found — approved without tombstoning` warning
+   on stderr.
+
+**`distill reject <id> [--reason "<text>"]`** — archives the entry in place
+(never deletes it): `status: archived`, appends a dated
+`rejected by human — <reason, default "not specified">` note. The file stays
+exactly where it was (`quarantine/` or `memories/`); `status: archived`
+alone is what excludes it from `distill review` and from every serving path
+(reindex still walks archived files — they just don't show up as pending or
+in search results).
+
+**Worked example — the decision-supersede flow.** A signed-off `decision`
+memory (`mem_20260710_8cd55e`, "useful skew is banned") is active. A later
+session argues the ban should be lifted. During RECONCILE the LLM proposes
+`SUPERSEDE` against that memory — but because its `type` is `decision` (team
+policy, not a fact), `reconcile.ts` does **not** apply it automatically. It
+instead writes a new quarantined entry with `supersedes: mem_20260710_8cd55e`
+and a note like `pending review — proposes to supersede
+mem_20260710_8cd55e: …`. The old rule keeps answering agent queries exactly
+as before.
+
+```bash
+bun run distill review
+# mem_20260711_a1b2c3 — Allow useful skew (pending review — proposes to supersede mem_20260710_8cd55e: …)
+
+bun run distill reject mem_20260711_a1b2c3 --reason "still banned"
+# rejected mem_20260711_a1b2c3
+```
+
+The proposal is archived, `mem_20260710_8cd55e` is never touched, and an
+agent asking about useful skew still gets the original "forbidden" answer.
+Had this been `approve`d instead, `mem_20260710_8cd55e` would be tombstoned
+(`status: superseded`, `superseded_by: mem_20260711_a1b2c3`) and the new
+entry would become the active answer. The other four memory types
+(`root_cause`, `pitfall`, `know_how`, `workflow`) are factual, not policy —
+their SUPERSEDEs still apply automatically, with no review step.
 
 ### Configuration
 
@@ -376,6 +442,50 @@ reinforcement signal. This makes it safe to point `mcp-server` at a
 git-synced read replica of the store, as long as `index.db` itself stays
 writable (see LLM_WIKI for what happens if it isn't).
 
+### CJK search & trigram FTS
+
+`memories_fts` uses FTS5's `trigram` tokenizer (not the default `unicode61`,
+which never splits a contiguous CJK run into separate tokens). `search()`
+(shared by the distiller's RECONCILE step and `search_memory`) partitions the
+query into tokens and picks a strategy per query:
+
+- Any token **≥ 3 code points** (checked with `[...token].length`, so a
+  3-character CJK run counts) → those tokens drive a normal `MATCH` query,
+  bm25-ranked as before. This covers both English words and CJK runs of 3+
+  characters, e.g. `"時序收斂"` or `"收斂技巧"` both match a lesson
+  containing `時序收斂技巧`.
+- If **no** token reaches 3 code points (e.g. a bare 2-character CJK query
+  like `"時序"`), the query falls back to an index-accelerated `LIKE` scan
+  (`title`/`trigger`/`lesson`/`domain` LIKE `%tok%`, OR-joined per token,
+  metacharacters `%`/`_` escaped) with `score = 0` for every hit — ordering
+  then falls entirely to confidence/recency. `"首都"` (a 2-char query with no
+  hits anywhere in the store) still returns `[]` without error; the LIKE path
+  never throws even against `%`/`_` inside the query text.
+- **Mixed queries ignore the short tokens.** If a query has at least one
+  ≥3-code-point token, only those tokens are used for MATCH — any shorter
+  tokens in the same query are silently dropped. This is documented behavior,
+  not a bug: don't expect a 2-char CJK token to add extra recall alongside a
+  longer English/CJK token in the same query.
+- **Index auto-rebuild on upgrade.** `index.db` tracks its own schema via
+  `PRAGMA user_version`. A pre-trigram (`< 2`) database is migrated in place
+  the first time it's opened after upgrading: the old FTS table is dropped
+  and recreated with the trigram tokenizer, and if the store already had
+  memory rows, `MemoryIndex.ftsRebuildNeeded` comes back `true`. Every
+  storeDir-owning entry point (`distiller/cli.ts`, `mcp-server/main.ts`,
+  `mcp-server/probe.ts`) checks this flag and calls `rebuildFrom(storeDir)`
+  automatically, printing
+  `agent-memory: fts schema upgraded — rebuilding index from <storeDir>`
+  to stderr exactly once. The very next invocation opens at `user_version =
+  2` already and does nothing extra — no manual `reindex` step required.
+  Fresh stores are created at `user_version = 2` directly and never see the
+  notice.
+- **English substring side effect.** Because trigram indexing is
+  character-based rather than word-based, it also enables substring matches
+  within English words that `unicode61` would have missed — e.g. a query for
+  `"parasitic"` now also matches text containing `"parasitics"`. This is a
+  mild recall improvement (bm25 ranking still applies on top), not a
+  regression; existing English search tests are the regression net for it.
+
 ## Development
 
 ```bash
@@ -395,10 +505,12 @@ shared/     config loading, project slugs, default DB path (shared with distille
 collector/  db.ts (read-only bundle load), transcript.ts (render), export.ts (skip/write rules),
             plugin.ts (session.idle hook), plugin-entry.ts (bundle entrypoint — exports only
             the plugin, per the opencode loader's function-exports-only contract), backfill.ts (CLI)
-distiller/  cli.ts (run/reindex/review/stats), pipeline.ts (stage orchestration), transcripts.ts
-            (spool scan/parse), extract.ts (prompt + validation), reconcile.ts (Mem0-style ADD/
-            UPDATE/SUPERSEDE/NOOP), store.ts (markdown entry read/write), ledger.ts (sqlite index +
-            idempotency), llm.ts (vllm / opencode-run clients)
+distiller/  cli.ts (run/reindex/review/approve/reject/stats), pipeline.ts (stage orchestration),
+            transcripts.ts (spool scan/parse), extract.ts (prompt + validation), reconcile.ts
+            (Mem0-style ADD/UPDATE/SUPERSEDE/NOOP, decision/convention SUPERSEDE interception),
+            reviewops.ts (approveEntry/rejectEntry — the human review loop), quarantine.ts
+            (shared uniquified quarantine writer), store.ts (markdown entry read/write), ledger.ts
+            (sqlite index + idempotency + trigram FTS), llm.ts (vllm / opencode-run clients)
 mcp-server/ query.ts (search/rank + get/list/stats over MemoryIndex), server.ts (buildServer():
             tool registration/schemas), main.ts (stdio entrypoint), probe.ts (in-memory-transport
             CLI probe, no MCP host required)
