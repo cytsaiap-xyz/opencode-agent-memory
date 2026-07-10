@@ -24,9 +24,11 @@ Three components, one monorepo:
 
 - **Fully on-prem.** No external API calls anywhere. LLM = self-hosted vLLM
   (OpenAI-compatible endpoint) in production; `opencode run` as dev fallback.
-- **Deployment environment uncertain** (locked-down corporate Linux likely).
-  Every deployable ships as a **single self-contained binary** via
-  `bun build --compile` — no npm install, no native compile deps at install time.
+- **Deployment:** corporate environment has npm / `bun install` available
+  (confirmed 2026-07-10), so standard installs are fine. Keep dependencies
+  minimal and pure-JS (no native compile deps); `bun build --compile`
+  single-binary output stays available as an optional convenience
+  (`bun run build:bin`), not a requirement.
 - **Storage core: markdown files + SQLite FTS5** (route C from the research
   reports in `docs/research/`). No vector DB, no graph DB in phase 1. SQLite via
   built-in `bun:sqlite` only.
