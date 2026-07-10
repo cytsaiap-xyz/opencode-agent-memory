@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { expect, test } from "bun:test"
 import { renderTranscript } from "./transcript"
 import type { SessionBundle } from "./db"
 
@@ -29,7 +29,8 @@ test("renders frontmatter, turns, anchors; drops noise part types and empty mess
   expect(r.userTurns).toBe(1)
   expect(r.markdown).toContain("session_id: ses_a")
   expect(r.markdown).toContain('title: "T \\"quoted\\""')
-  expect(r.markdown).toContain("model: opencode/big-pickle")
+  expect(r.markdown).toContain('project_dir: "/x/projA"')
+  expect(r.markdown).toContain('model: "opencode/big-pickle"')
   expect(r.markdown).toContain("## T1 [00:00] User {#msg_u1}")
   expect(r.markdown).toContain("hello") // trimmed
   expect(r.markdown).toContain("## T2 [00:00] Assistant {#msg_a1}")
@@ -67,5 +68,5 @@ test("model falls back to last message modelID when session.model is absent", ()
   const noModel = bundle()
   noModel.session.model = null
   const r = renderTranscript(noModel, new Date())
-  expect(r.markdown).toContain("model: m2")
+  expect(r.markdown).toContain('model: "m2"')
 })

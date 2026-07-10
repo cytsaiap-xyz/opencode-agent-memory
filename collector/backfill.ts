@@ -43,7 +43,13 @@ if (import.meta.main) {
     console.error("--limit must be a positive integer")
     process.exit(1)
   }
-  const summary = await runBackfill(loadConfig(), dbPath, { limit })
+  let summary: BackfillSummary
+  try {
+    summary = await runBackfill(loadConfig(), dbPath, { limit })
+  } catch (e) {
+    console.error(`backfill: could not open database ${dbPath}: ${e instanceof Error ? e.message : String(e)}`)
+    process.exit(1)
+  }
   console.log(
     `backfill done: ${summary.written} written, ${summary.unchanged} unchanged, ` +
       `${summary.skipped} skipped, ${summary.errors} errors`,

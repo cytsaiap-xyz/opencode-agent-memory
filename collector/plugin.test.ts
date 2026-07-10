@@ -75,3 +75,25 @@ test("exporter failure is swallowed and logged, never thrown", async () => {
   expect(log).toContain("ERROR")
   expect(log).toContain("db exploded")
 })
+
+test("malformed event (null) never throws", async () => {
+  const plugin = createCollectorPlugin({
+    env: { AGENT_MEMORY_HOME: join(tmp(), "mem") },
+    exportSession: async () => {
+      throw new Error("should not be called")
+    },
+  })
+  const hooks = await plugin(ctx)
+  await expect(hooks.event!({ event: null as never })).resolves.toBeUndefined()
+})
+
+test("event missing properties never throws", async () => {
+  const plugin = createCollectorPlugin({
+    env: { AGENT_MEMORY_HOME: join(tmp(), "mem") },
+    exportSession: async () => {
+      throw new Error("should not be called")
+    },
+  })
+  const hooks = await plugin(ctx)
+  await expect(hooks.event!({ event: { type: "session.idle" } as never })).resolves.toBeUndefined()
+})

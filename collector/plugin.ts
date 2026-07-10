@@ -26,14 +26,22 @@ export function createCollectorPlugin(deps: {
 
     return {
       event: async ({ event }) => {
-        if (event.type !== "session.idle") return
-        const sessionID = (event.properties as { sessionID?: string }).sessionID
-        if (!sessionID) return
+        // The entire hook body runs inside this try/catch: no input shape
+        // (null event, missing properties, wrong types) may reject into the
+        // opencode host (recurring pitfall: never-throw hooks).
         try {
-          const res = await doExport(cfg, dbPath, sessionID)
-          await log(`${sessionID}: ${res.status}${res.reason ? ` (${res.reason})` : ""}`)
+          const type = (event as { type?: string } | null)?.type
+          if (type !== "session.idle") return
+          const sessionID = (event as { properties?: { sessionID?: string } } | null)?.properties?.sessionID
+          if (!sessionID) return
+          try {
+            const res = await doExport(cfg, dbPath, sessionID)
+            await log(`${sessionID}: ${res.status}${res.reason ? ` (${res.reason})` : ""}`)
+          } catch (e) {
+            await log(`ERROR ${sessionID}: ${e instanceof Error ? e.message : String(e)}`)
+          }
         } catch (e) {
-          await log(`ERROR ${sessionID}: ${e instanceof Error ? e.message : String(e)}`)
+          await log(`ERROR event-hook: ${e instanceof Error ? e.message : String(e)}`)
         }
       },
     }

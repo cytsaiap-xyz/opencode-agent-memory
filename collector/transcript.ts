@@ -81,9 +81,9 @@ export function renderTranscript(bundle: SessionBundle, exportedAt: Date): Trans
   const header = [
     "---",
     `session_id: ${bundle.session.id}`,
-    `project_dir: ${bundle.session.directory}`,
+    `project_dir: ${JSON.stringify(bundle.session.directory)}`,
     `title: ${JSON.stringify(bundle.session.title)}`,
-    `model: ${sessionModel(bundle)}`,
+    `model: ${JSON.stringify(sessionModel(bundle))}`,
     `time_start: ${iso(bundle.session.time_created)}`,
     `time_end: ${iso(bundle.session.time_updated)}`,
     `turns: ${turns}`,

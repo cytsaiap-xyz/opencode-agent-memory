@@ -58,9 +58,9 @@ full contract):
 ```markdown
 ---
 session_id: ses_…
-project_dir: /path/to/project
+project_dir: "/path/to/project"
 title: "…"
-model: provider/model
+model: "provider/model"
 time_start: ISO8601
 time_end: ISO8601
 turns: 22
