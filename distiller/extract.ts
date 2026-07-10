@@ -8,7 +8,7 @@ export interface Candidate {
   salience: number; volatile: boolean
 }
 
-const TYPES: readonly string[] = ["decision", "root_cause", "pitfall", "know_how", "convention", "workflow"]
+const TYPES: readonly MemoryType[] = ["decision", "root_cause", "pitfall", "know_how", "convention", "workflow"]
 
 export const EXTRACT_SCHEMA: Record<string, unknown> = {
   type: "array",
@@ -65,13 +65,28 @@ const SECRET_PATTERNS: Array<{ label: string; re: RegExp }> = [
   { label: "token-prefix", re: /\b(?:sk|ghp|gho|xox[bpas])[-_][A-Za-z0-9]{16,}\b/ },
 ]
 
+const HEX_DIGEST_RE = /^(?:sha\d+:)?[0-9a-fA-F]{16,}$/
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
+const BENIGN_SEPARATOR_RE = /^[A-Za-z0-9:\-._/]$/
+
 export function scanSecrets(text: string): string[] {
   const matches: string[] = []
   for (const { label, re } of SECRET_PATTERNS) if (re.test(text)) matches.push(label)
   for (const token of text.split(/\s+/)) {
     if (token.length < 32) continue
+    if (token.includes("://")) continue
+    if (HEX_DIGEST_RE.test(token)) continue
+    if (UUID_RE.test(token)) continue
+
     const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter((re) => re.test(token)).length
-    if (classes >= 3) {
+    const hasNonBenignSymbol = [...token].some((ch) => !BENIGN_SEPARATOR_RE.test(ch))
+    const isPureAlnum = /^[A-Za-z0-9]+$/.test(token)
+    const hasAllThreeAlnumClasses = /[a-z]/.test(token) && /[A-Z]/.test(token) && /[0-9]/.test(token)
+
+    if (
+      (token.length >= 32 && classes >= 3 && hasNonBenignSymbol) ||
+      (token.length >= 48 && isPureAlnum && hasAllThreeAlnumClasses)
+    ) {
       matches.push("high-entropy-token")
       break
     }
@@ -96,10 +111,10 @@ export function validateCandidates(raw: string, meta: TranscriptMeta, salienceMi
     const o = (typeof item === "object" && item !== null ? item : {}) as Record<string, unknown>
     if (typeof o.salience === "number" && o.salience < salienceMin) continue // below threshold: drop silently
 
-    if (typeof o.type !== "string" || !TYPES.includes(o.type)) reasons.push(`invalid type "${String(o.type)}"`)
+    if (typeof o.type !== "string" || !(TYPES as readonly string[]).includes(o.type)) reasons.push(`invalid type "${String(o.type)}"`)
     for (const key of ["title", "trigger", "lesson"] as const)
       if (typeof o[key] !== "string" || (o[key] as string).trim() === "") reasons.push(`${key} must be a non-empty string`)
-    if (typeof o.lesson === "string" && o.lesson.split(/\s+/).length > 80) reasons.push("lesson exceeds 80 words")
+    if (typeof o.lesson === "string" && o.lesson.trim().split(/\s+/).length > 80) reasons.push("lesson exceeds 80 words")
     if (!Array.isArray(o.domain) || o.domain.length === 0 || !o.domain.every((d) => typeof d === "string" && d))
       reasons.push("domain must be a non-empty string array")
     if (!Array.isArray(o.evidence) || o.evidence.length === 0) reasons.push("evidence must be a non-empty array")

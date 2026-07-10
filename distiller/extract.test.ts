@@ -50,6 +50,14 @@ test("field violations collect ALL reasons; below-salience silently dropped", ()
   expect(reasons).toContain("domain")
 })
 
+test("lesson of exactly 80 words with trailing whitespace is not rejected", () => {
+  const lesson = Array(80).fill("word").join(" ") + " "
+  const ok = cand({ lesson })
+  const r = validateCandidates(JSON.stringify([ok]), meta, 6)
+  expect(r.rejected.length).toBe(0)
+  expect(r.valid.length).toBe(1)
+})
+
 test("unparseable output throws; non-array throws", () => {
   expect(() => validateCandidates("not json at all {", meta, 6)).toThrow()
   expect(() => validateCandidates('{"a":1}', meta, 6)).toThrow(/array/)
@@ -68,4 +76,32 @@ test("scanSecrets catches PEM, AWS keys, token prefixes, high-entropy blobs; cle
   expect(scanSecrets("ghp_abcdEFGH0123456789ijkl")).not.toEqual([])
   expect(scanSecrets("aB3$" + "xY9#".repeat(10))).not.toEqual([])
   expect(scanSecrets("re-extract parasitics before running STA")).toEqual([])
+})
+
+test("scanSecrets does not flag benign engineering shapes", () => {
+  const sha256Digest = "sha256:" + "a1b2c3d4e5f6".repeat(6)
+  expect(scanSecrets(`digest ${sha256Digest} matches`)).toEqual([])
+
+  const url = "https://example.com/api/v2/resource?a=b&c=d3&token=abc123def456ghi789"
+  expect(scanSecrets(`fetch ${url} to continue`)).toEqual([])
+
+  const uuid = "550e8400-e29b-41d4-a716-446655440000"
+  expect(scanSecrets(`id is ${uuid} in the table`)).toEqual([])
+
+  const camelIdentifier = "myLongCamelCaseIdentifier123456WithDigitsHere"
+  expect(scanSecrets(`variable ${camelIdentifier} was renamed`)).toEqual([])
+})
+
+test("scanSecrets still flags dedicated patterns and refined high-entropy shapes", () => {
+  expect(scanSecrets("-----BEGIN RSA PRIVATE KEY-----")).not.toEqual([])
+  expect(scanSecrets("AKIA0123456789ABCDEF")).not.toEqual([])
+  expect(scanSecrets("ghp_abcdEFGH0123456789ijkl")).not.toEqual([])
+
+  // 32+ char base64-like token with '+' and '=' and 3+ char classes
+  const base64ish = "aGVsbG8gd29ybGQ+dGhpcyBpcyBhIHRlc3Q9"
+  expect(scanSecrets(`token ${base64ish} set`)).not.toEqual([])
+
+  // 48+ char pure-alphanumeric mixed-case+digit token
+  const pureAlnum48 = "aB3cD4eF5gH6iJ7kL8mN9oP0qR1sT2uV3wX4yZ5aB6cD7eF8"
+  expect(scanSecrets(`key ${pureAlnum48} used`)).not.toEqual([])
 })
