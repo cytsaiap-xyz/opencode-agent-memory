@@ -7,7 +7,9 @@ import type { Cluster } from "./cluster"
 import { openMemoryIndex } from "./indexes"
 import type { MemoryQuery } from "./indexes"
 import type { LlmClient } from "./llm"
+import { proposeSupersessionPending } from "./reconcile"
 import { buildReflectPrompt, parseReflectOp, REFLECT_SCHEMA, runReflect, type ReflectDeps } from "./reflect"
+import { approveEntry } from "./reviewops"
 import { entryId, entryPath, readEntry, writeEntry } from "./store"
 import type { MemoryEntry } from "./types"
 
@@ -272,6 +274,34 @@ test("insight: judge gate above threshold passes and records the judge note", as
   expect(insightEntry.notes.some((n) => n.includes("judged: median 8"))).toBe(true)
 })
 
+test("FIX 2: insight judge panel total failure (all judges abstain) withholds the insight instead of auto-passing on the fallback self-score", async () => {
+  const { storeDir, index, cfg } = setup()
+  const a = entry("mem_20260710_jf01aa", { title: "message queue backlog spike pattern alpha", trigger: "queue depth alarm", domain: ["mq1"] })
+  const b = entry("mem_20260710_jf01bb", { title: "message queue backlog spike pattern beta", trigger: "queue depth alarm", domain: ["mq1"] })
+  await seedActive(storeDir, index, a)
+  await seedActive(storeDir, index, b)
+
+  const insightReply = JSON.stringify({
+    op: "insight", type: "know_how", title: "Queue backlog insight",
+    trigger: "queue depth alarm", lesson: "Scale consumers before the backlog alarm fires.",
+    domain: ["mq1"], cites: [a.id, b.id],
+  })
+  // The op call succeeds, but every one of the 3 judge calls returns unparseable garbage —
+  // judgeCandidate abstains on each, so verdict.usedFallback is true (synthetic self-score
+  // 10, since the candidate's own salience is hardcoded to 10 for reflect insights). Before
+  // FIX 2 this self-score auto-passed; now a fully-failed panel must withhold the insight.
+  const judgeReplies = [insightReply, "not json", "not json", "not json"]
+  const logLines: string[] = []
+  const summary = await runReflect(cfg, baseDeps({
+    index, storeDir, llm: queueLlm(judgeReplies), judges: 3, salienceMin: 6, log: (l) => logLines.push(l),
+  }))
+
+  expect(summary.insights).toBe(0)
+  expect(summary.skipped).toBe(1)
+  expect(mdFilesUnder(join(storeDir, "memories", "proja")).length).toBe(2) // nothing new written
+  expect(logLines.some((l) => l.includes("insight judge panel failed — withheld"))).toBe(true)
+})
+
 test("insight: an id collision with a pre-existing unrelated entry never overwrites it (uniquifies to -2)", async () => {
   const { storeDir, index, cfg } = setup()
   const a = entry("mem_20260710_ins1a1", { title: "race condition in queue drain alpha", trigger: "queue drain race", domain: ["queue2"] })
@@ -342,6 +372,10 @@ test("merge: absorbs a non-policy member directly, keep gains evidence + note", 
   const keepHit = index.getById(keep.id)!
   expect(keepHit.entry.evidence.map((e) => e.session).sort()).toEqual(["ses_a1", "ses_k1"])
   expect(keepHit.entry.notes.some((n) => n.includes("absorbed") && n.includes(absorb.id))).toBe(true)
+  // FIX 3: confidence is recomputed over the post-absorption distinct session count, same
+  // formula as reconcile's applyUpdate — keep started at 1 session (default confidence
+  // 0.5), absorbing 1 new session raises it to computeConfidence({sessions:2,...}) = 0.65.
+  expect(keepHit.entry.confidence).toBe(0.65)
 })
 
 test("merge: absorbing a policy-type (decision/convention) member routes to quarantine review (mergesPending++), target untouched", async () => {
@@ -369,7 +403,11 @@ test("merge: absorbing a policy-type (decision/convention) member routes to quar
   const qEntry = await readEntry(join(storeDir, "quarantine", qFiles[0]!))
   expect(qEntry.status).toBe("quarantined")
   expect(qEntry.review).toBe("human_pending")
-  expect(qEntry.supersedes).toBe(absorb.id)
+  // Convergent design: the proposal supersedes KEEP (not the absorb id) and carries every
+  // absorbed id in `absorbs` — approving it replaces keep with one enriched entry instead
+  // of activating a keep-content clone alongside the still-active original.
+  expect(qEntry.supersedes).toBe(keep.id)
+  expect(qEntry.absorbs).toEqual([absorb.id])
 })
 
 test("merge: policy-type KEEP is never mutated by absorption even when the absorb member itself is non-policy — whole merge routes to pending review", async () => {
@@ -407,7 +445,8 @@ test("merge: policy-type KEEP is never mutated by absorption even when the absor
   const qEntry = await readEntry(join(storeDir, "quarantine", qFiles[0]!))
   expect(qEntry.status).toBe("quarantined")
   expect(qEntry.review).toBe("human_pending")
-  expect(qEntry.supersedes).toBe(absorb.id)
+  expect(qEntry.supersedes).toBe(keep.id)
+  expect(qEntry.absorbs).toEqual([absorb.id])
 })
 
 test("merge: rerunning after a policy merge counts as skipped (not a new mergesPending) with no new quarantine writes", async () => {
@@ -463,6 +502,101 @@ test("merge: an absorb member already superseded earlier in the same run (multi-
   expect(aHit.entry.superseded_by).toBe(b.id)
   const cHit = index.getById(c.id)!
   expect(cHit.entry.status).toBe("active")
+})
+
+// ---------------------------------------------------------------------------
+// FIX 1: convergent policy-merge approval (walk-to-end)
+// ---------------------------------------------------------------------------
+
+test("FIX 1: policy keep + absorb -> ONE pending proposal -> approve -> active set has ONLY the enriched entry, keep+absorb both superseded -> second reflect run makes zero new ops", async () => {
+  const { storeDir, index, cfg } = setup()
+  const keep = entry("mem_20260710_conv1k", {
+    type: "convention", title: "commit scope prefix convention rule alpha", trigger: "new commit created", domain: ["conv1"],
+    evidence: [{ session: "ses_keep1", anchors: ["mk1"], observed_at: "2026-07-10T00:00:00.000Z" }],
+  })
+  const absorb = entry("mem_20260710_conv1a", {
+    type: "pitfall", title: "commit scope prefix convention rule beta", trigger: "new commit created", domain: ["conv1"],
+    evidence: [{ session: "ses_absorb1", anchors: ["ma1"], observed_at: "2026-07-10T00:00:00.000Z" }],
+  })
+  await seedActive(storeDir, index, keep)
+  await seedActive(storeDir, index, absorb)
+
+  const mergeReply = JSON.stringify({ op: "merge", keep: keep.id, absorb: [absorb.id], reason: "same lesson, different wording" })
+
+  // --- run 1: reflect proposes exactly one pending merge ---
+  const first = await runReflect(cfg, baseDeps({ index, storeDir, llm: fakeLlm(mergeReply) }))
+  expect(first.mergesPending).toBe(1)
+  expect(first.merges).toBe(0)
+
+  const qFiles = mdFilesUnder(join(storeDir, "quarantine"))
+  expect(qFiles.length).toBe(1)
+  const pending = await readEntry(join(storeDir, "quarantine", qFiles[0]!))
+  expect(pending.status).toBe("quarantined")
+  expect(pending.review).toBe("human_pending")
+  expect(pending.supersedes).toBe(keep.id)
+  expect(pending.absorbs).toEqual([absorb.id])
+  expect(pending.promoted_from).toBeNull()
+  expect(pending.evidence.map((e) => e.session).sort()).toEqual(["ses_absorb1", "ses_keep1"])
+  expect(pending.notes.some((n) => n.includes("merge proposal: enriched replacement of") && n.includes(keep.id) && n.includes(absorb.id))).toBe(true)
+
+  // keep and absorb are BOTH still active — nothing is applied until a human approves.
+  expect(index.getById(keep.id)!.entry.status).toBe("active")
+  expect(index.getById(absorb.id)!.entry.status).toBe("active")
+
+  // --- approve: the active set converges to exactly the enriched entry ---
+  const result = await approveEntry(storeDir, index, pending.id, NOW)
+  const finalId = result.entry.id
+
+  expect(result.entry.status).toBe("active")
+  expect(result.entry.evidence.map((e) => e.session).sort()).toEqual(["ses_absorb1", "ses_keep1"])
+  expect(result.entry.confidence).toBe(0.85) // computeConfidence({sessions:2, humanApproved:true,...})
+
+  const keepAfter = index.getById(keep.id)!
+  expect(keepAfter.entry.status).toBe("superseded")
+  expect(keepAfter.entry.superseded_by).toBe(finalId)
+
+  const absorbAfter = index.getById(absorb.id)!
+  expect(absorbAfter.entry.status).toBe("superseded")
+  expect(absorbAfter.entry.superseded_by).toBe(finalId)
+
+  const finalHit = index.getById(finalId)!
+  expect(finalHit.entry.status).toBe("active")
+
+  // --- second reflect run: no active pair left to re-cluster, zero new ops ---
+  const second = await runReflect(cfg, baseDeps({
+    index, storeDir,
+    llm: { describe: () => "fake", complete: async () => { throw new Error("should not be called — nothing left to cluster") } },
+  }))
+  expect(second.clusters).toBe(0)
+  expect(second.insights).toBe(0)
+  expect(second.merges).toBe(0)
+  expect(second.mergesPending).toBe(0)
+  expect(mdFilesUnder(join(storeDir, "quarantine")).length).toBe(0) // the approved proposal moved out, nothing new queued
+})
+
+// ---------------------------------------------------------------------------
+// FIX 4: proposeSupersessionPending's clone never inherits promoted_from/absorbs
+// ---------------------------------------------------------------------------
+
+test("FIX 4: proposeSupersessionPending nulls both promoted_from and absorbs on its clone even when the base entry carries them", async () => {
+  const { storeDir, index } = setup()
+  const byIdEntry = entry("mem_20260710_fix4by", {
+    type: "convention", title: "base entry with stale fields", trigger: "t",
+    promoted_from: "mem_some_promotion_source",
+    absorbs: ["mem_some_prior_absorb"],
+  })
+  const target = entry("mem_20260710_fix4tg", { type: "pitfall", title: "target being merged away", trigger: "t2" })
+  await seedActive(storeDir, index, byIdEntry)
+  await seedActive(storeDir, index, target)
+
+  const result = await proposeSupersessionPending(target, byIdEntry.id, "regression coverage", {
+    storeDir, index, now: NOW,
+  })
+
+  expect(result.op).toBe("SUPERSEDE_PENDING")
+  expect(result.entry.promoted_from).toBeNull()
+  expect(result.entry.absorbs).toBeNull()
+  expect(result.entry.supersedes).toBe(target.id)
 })
 
 // ---------------------------------------------------------------------------

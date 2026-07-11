@@ -43,6 +43,7 @@ export function serializeEntry(e: MemoryEntry): string {
     `superseded_by: ${enc(e.superseded_by)}`,
     `supersedes: ${enc(e.supersedes)}`,
     `promoted_from: ${enc(e.promoted_from)}`,
+    `absorbs: ${JSON.stringify(e.absorbs ?? null)}`,
     `review: ${enc(e.review)}`,
     `evidence: ${JSON.stringify(e.evidence)}`,
     `provenance: ${JSON.stringify(e.provenance)}`,
@@ -126,6 +127,9 @@ export function parseEntry(markdown: string): MemoryEntry {
   const promotedFrom = fields.has("promoted_from") ? fields.get("promoted_from") : null
   if (promotedFrom !== null && typeof promotedFrom !== "string")
     throw new Error(`memory entry: field "promoted_from" must be string or null`)
+  const absorbs = fields.has("absorbs") ? fields.get("absorbs") : null
+  if (absorbs !== null && (!Array.isArray(absorbs) || !absorbs.every((a) => typeof a === "string")))
+    throw new Error(`memory entry: field "absorbs" must be a string array or null`)
   const scope = oneOf("scope", ["project", "global"] as const)
 
   return {
@@ -143,6 +147,7 @@ export function parseEntry(markdown: string): MemoryEntry {
     superseded_by: supersededBy,
     supersedes,
     promoted_from: promotedFrom,
+    absorbs: absorbs as string[] | null,
     review: oneOf("review", REVIEWS),
     evidence: evidence as EvidenceRef[],
     provenance: { extractor: provenance.extractor, prompt_hash: provenance.prompt_hash },

@@ -87,6 +87,7 @@ function createMemoryEntry(id: string, project: string): MemoryEntry {
     superseded_by: null,
     supersedes: null,
     promoted_from: null,
+    absorbs: null,
     review: "auto",
     evidence: [{ session: "ses_test", anchors: ["msg_1"], observed_at: "2026-07-11T00:00:00Z" }],
     provenance: { extractor: "test", prompt_hash: "test" },

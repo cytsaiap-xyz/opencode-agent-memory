@@ -465,12 +465,25 @@ members；輸出依 cluster 大小由大到小排序（決定性 tie-break）。
    `derived from: <排序後的 member id 清單>`，evidence 是所有 member
    evidence 的聯集（依 session 去重）。
 2. **`merge`**——兩個以上 member 講的是同一件事、只是用詞不同（RECONCILE
-   當初漏掉的近重複）。被吸收的 member 走**跟 RECONCILE 完全一樣的
-   supersession 機制**（`applySupersession`，從 `reconcile.ts` 抽出來共用）
-   ——包括**同一個 policy gate**：只要 keep 或任一 absorb member 是
-   `decision`/`convention` 型，就不會直接套用，而是寫進待審佇列
-   （`SUPERSEDE_PENDING`，走 `distill review`/`approve`/`reject`，跟上面
-   「決策翻案」worked example 同一套流程）。
+   當初漏掉的近重複）。非 policy 的 absorb member 走**跟 RECONCILE 完全一樣
+   的 supersession 機制**（`applySupersession`，從 `reconcile.ts` 抽出來
+   共用）——直接 tombstone，evidence 併入 keep，keep 的 confidence 照
+   RECONCILE `applyUpdate` 同一條公式（`computeConfidence`，distinct
+   session 數）重算。只要 keep 或任一 absorb member 是
+   `decision`/`convention` 型（policy gate），該 absorb 就不會直接套用，
+   而是併進**單一一筆** enriched-keep 待審提案：內容是 keep 本身欄位 +
+   所有 policy-routed absorb member 的 evidence 聯集（依 session
+   去重）+ 重算的 confidence，`supersedes: <keep id>`、
+   `absorbs: [<absorb id 清單>]`、`promoted_from` 明確設 `null`。**`approve`**
+   這筆提案時（`reviewops.ts: approveEntry`）除了照常 tombstone
+   `supersedes` 指到的 keep，還會**額外** tombstone `absorbs`清單裡的每一個
+   id，三者的 `superseded_by` 都指向最終批准的 id——active set 收斂成
+   唯一一筆 enriched entry，不會出現 keep 跟批准後的副本同時 active
+   的重複（這是 v1 clone-based 設計的 convergence bug，clone
+   supersedes 指向 absorb id、keep 本身不被 tombstone，批准後
+   `{keep, clone}` 兩筆同時 active，下次 reflect 又把它們重新聚成一類，
+   永遠循環提案）。走 `distill review`/`approve`/`reject`，跟上面
+   「決策翻案」worked example 同一套審查佇列。
 3. **`none`**——cluster 只是主題巧合，不做事。
 
 Cluster pass 跑完後，reflect 還會做一次**promotion 掃描**：任何
@@ -499,10 +512,26 @@ RECONCILE 同一支 supersession 程式碼（decision/convention 待審 gate 因
 **Stateless（可以隨時重跑）**：reflect 本身不帶任何跨 run 的狀態，冪等性
 完全從磁碟上現有的資料推導：cluster 重新形成時，只要有 active entry 的
 notes 已經帶著一模一樣的 `derived from: <ids>` tag 就跳過；merge 只要
-absorb members 都已經不在（或者，走 policy 待審路徑的話，每個 absorb id
-都已經有一筆待審提案）就跳過；promotion 只要有任何非 archived entry 已經
-帶 `promoted_from: <來源 id>` 就跳過。緊接著 `distill reflect` 完整跑一次
-後立刻重跑，理論上應該全部 skip、零新檔案。
+absorb members 都已經不在就跳過（直接吸收的路徑）；全走 policy 待審路徑
+的 merge（每個 absorb 都是 policy-routed）則是找 `supersedes === keep id`
+的既有待審提案，有就跳過（**不是**按 absorb id 找——enriched-keep 提案的
+`supersedes` 指向 keep，不是任一 absorb）；promotion 只要有任何非
+archived entry 已經帶 `promoted_from: <來源 id>` 就跳過。緊接著
+`distill reflect` 完整跑一次後立刻重跑，理論上應該全部 skip、零新檔案
+——**approve 一筆 policy-merge 提案之後**也是如此：keep 跟每個 absorb
+都被 tombstone，active set 只剩下批准後的唯一一筆 enriched entry，沒有
+可以重新聚類的一對，reflect 自然收斂成零新 op（見下方「已知注意事項」）。
+
+> **已知注意事項（rejected 提案會在下次 reflect 重新出現）**：`reject`
+> 一筆 merge 或 promotion 提案，語意是「這一次不要」，不是「永遠不要」。
+> quarantine 副本被 `reject` 後狀態變成 `archived`，本身不會再被批准；但
+> 觸發這次提案的**條件**（keep/absorb 的 domain + title/trigger 相似度、
+> 或 evidence 橫跨 ≥2 project 的訊號）如果還在，下一次 `distill reflect`
+> 一樣會重新判斷、重新產生一筆**新的**待審提案（新 id，不是被 reject 的
+> 那筆復活）。如果確定不想再被提案，要處理掉**來源條目**的觸發因素本身
+> ——例如把其中一個 member 手動 archive、改寫 title/trigger 讓相似度降到
+> 門檻以下、或人工修掉 `"promotion candidate"` note——單純 `reject` 不會
+> 讓提案「消失」，只是暫時把這一版擋下來。
 
 **Dry-run-first SOP**：`--dry-run` 照樣算出並印出每個 op（cluster 判斷還是
 會呼叫 LLM——dry-run 只跳過**寫入**這一步），但對 store **零寫入**。一定

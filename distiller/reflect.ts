@@ -9,7 +9,7 @@ import type { MemoryQuery } from "./indexes"
 import { judgeCandidate } from "./judge"
 import type { LlmClient } from "./llm"
 import { writeQuarantineEntry } from "./quarantine"
-import { applySupersession, findExistingPending, proposeSupersessionPending } from "./reconcile"
+import { applySupersession, findExistingPending } from "./reconcile"
 import { computeConfidence, entryId, entryPath, listEntryPaths, readEntry, uniquifyEntryId, writeEntry } from "./store"
 import { scanSpool } from "./transcripts"
 import type { EvidenceRef, MemoryEntry, MemoryStatus, MemoryType } from "./types"
@@ -242,13 +242,22 @@ export async function runReflect(cfg: MemoryConfig, deps: ReflectDeps, opts?: { 
         let judgeNote: string | undefined
         if (deps.judges > 1) {
           const verdict = await judgeCandidate(candidate, deps.llm, deps.judges)
+          // Fail CLOSED, not open: a total panel failure (every judge abstained) makes
+          // judgeCandidate fall back to the candidate's own synthetic self-score (10 for a
+          // reflect-derived insight, by construction above), which would otherwise
+          // auto-pass every insight whenever the judge panel is unavailable. An insight
+          // that never got independent judgment is withheld, not written on a
+          // rubber-stamped self-score.
+          if (verdict.usedFallback) {
+            summary.skipped++
+            deps.log(`reflect: cluster [${memberIds.join(",")}] insight judge panel failed — withheld`)
+            continue
+          }
           if (verdict.salience < deps.salienceMin) {
             summary.skipped++
             continue
           }
-          judgeNote = verdict.usedFallback
-            ? `judged: fallback self-score ${verdict.selfScore} (0/${verdict.panel})`
-            : `judged: median ${verdict.salience} (${verdict.voted}/${verdict.panel})`
+          judgeNote = `judged: median ${verdict.salience} (${verdict.voted}/${verdict.panel})`
         }
 
         const sortedMembers = [...cluster.members].sort((a, b) => a.entry.id.localeCompare(b.entry.id))
@@ -280,6 +289,7 @@ export async function runReflect(cfg: MemoryConfig, deps: ReflectDeps, opts?: { 
           superseded_by: null,
           supersedes: null,
           promoted_from: null,
+          absorbs: null,
           review: "auto",
           evidence,
           provenance: { extractor: `distiller v0.1 reflect / ${deps.llm.describe()}`, prompt_hash: REFLECT_PROMPT_HASH },
@@ -320,21 +330,6 @@ export async function runReflect(cfg: MemoryConfig, deps: ReflectDeps, opts?: { 
         continue
       }
 
-      // Idempotency: a policy-routed absorb stays "active" (nothing is applied until a
-      // human approves the pending proposal), so alreadyGone above can't catch a rerun of
-      // the SAME cluster — the cluster still reforms every run. If EVERY absorb member
-      // already has a pending proposal targeting it specifically (findExistingPending
-      // only ever matches status "quarantined" + review "human_pending", i.e. inherently
-      // non-archived), this merge was already proposed and nothing has changed since:
-      // count the rerun as skipped instead of re-incrementing mergesPending or touching
-      // the store again.
-      const allAbsorbsAlreadyPending = op.absorb.every((id) => findExistingPending(deps.storeDir, id) !== null)
-      if (allAbsorbsAlreadyPending) {
-        summary.skipped++
-        deps.log(`reflect: cluster [${memberIds.join(",")}] merge already pending review — skipping`)
-        continue
-      }
-
       // decision/convention KEEP entries are deliberate human calls — same governance
       // reconcile.ts already applies to its own UPDATE/SUPERSEDE targets. Absorbing
       // evidence into a policy KEEP via a raw writeEntry would be an ungated mutation of
@@ -344,47 +339,103 @@ export async function runReflect(cfg: MemoryConfig, deps: ReflectDeps, opts?: { 
       // instead of being applied directly. Policy entries only change through
       // human-approved ops.
       const keepIsPolicy = keepItem.entry.type === "decision" || keepItem.entry.type === "convention"
+      const policyAbsorbIds = op.absorb.filter((id) => {
+        const t = cluster.members.find((m) => m.entry.id === id)!.entry
+        return keepIsPolicy || t.type === "decision" || t.type === "convention"
+      })
+      const directAbsorbIds = op.absorb.filter((id) => !policyAbsorbIds.includes(id))
+
+      // Idempotency: a policy-routed absorb stays "active" (nothing is applied until a
+      // human approves the pending proposal), so alreadyGone above can't catch a rerun of
+      // the SAME cluster — the cluster still reforms every run. This only fires for an
+      // ALL-policy merge (every absorb id routed to pending review): a mixed merge always
+      // has at least one direct absorb already tombstoned by the first run, which
+      // alreadyGone above already caught. supersedes now points at the KEEP (not the
+      // absorb ids — see the enriched-proposal construction below), so a pending proposal
+      // "for this merge" is found by looking up keep.id, not any absorb id.
+      if (policyAbsorbIds.length === op.absorb.length && findExistingPending(deps.storeDir, op.keep) !== null) {
+        summary.skipped++
+        deps.log(`reflect: cluster [${memberIds.join(",")}] merge already pending review — skipping`)
+        continue
+      }
 
       const dateStr = deps.now.toISOString().slice(0, 10)
       const directlyAbsorbed: MemoryEntry[] = []
 
-      for (const absorbId of op.absorb) {
+      // Non-policy absorbs: unchanged direct-tombstone path.
+      for (const absorbId of directAbsorbIds) {
         const target = cluster.members.find((m) => m.entry.id === absorbId)!.entry
-        const isPolicy = keepIsPolicy || target.type === "decision" || target.type === "convention"
-
-        if (isPolicy) {
-          summary.mergesPending++
-          const why = keepIsPolicy ? `keep ${op.keep} is policy-type (${keepItem.entry.type})` : `${target.id} is policy-type (${target.type})`
-          if (deps.dryRun) deps.log(`[dry-run] merge: ${target.id} -> pending review (${why}), absorbed by ${op.keep}`)
-          else await proposeSupersessionPending(target, keepItem.entry.id, op.reason, { storeDir: deps.storeDir, index: deps.index, now: deps.now })
-        } else {
-          summary.merges++
-          statusOverride.set(target.id, "superseded")
-          directlyAbsorbed.push(target)
-          if (deps.dryRun) deps.log(`[dry-run] merge: ${target.id} -> superseded by ${op.keep}`)
-          else await applySupersession(target, keepItem.entry.id, op.reason, { storeDir: deps.storeDir, index: deps.index, now: deps.now })
-        }
+        summary.merges++
+        statusOverride.set(target.id, "superseded")
+        directlyAbsorbed.push(target)
+        if (deps.dryRun) deps.log(`[dry-run] merge: ${target.id} -> superseded by ${op.keep}`)
+        else await applySupersession(target, keepItem.entry.id, op.reason, { storeDir: deps.storeDir, index: deps.index, now: deps.now })
       }
 
-      if (keepIsPolicy) {
-        deps.log(
-          `reflect: merge keep ${op.keep} is policy-type (${keepItem.entry.type}) — evidence absorption from ${op.absorb.join(",")} withheld pending review`,
-        )
-      } else if (directlyAbsorbed.length > 0) {
+      if (directlyAbsorbed.length > 0) {
         if (deps.dryRun) {
           deps.log(`[dry-run] merge: keep ${op.keep} gains evidence from ${directlyAbsorbed.map((e) => e.id).join(",")}`)
         } else {
           const keepHit = deps.index.getById(op.keep)
           const currentKeep = keepHit ? keepHit.entry : keepItem.entry
           const merged = unionEvidenceRefs([currentKeep.evidence, ...directlyAbsorbed.map((e) => e.evidence)])
+          // FIX 3: recompute confidence exactly like reconcile's applyUpdate — over the
+          // distinct session count post-merge, carrying forward whatever human-approval
+          // state the keep already has. Previously this was left stale at whatever
+          // confidence the keep happened to have before absorption.
+          const sessions = new Set(merged.map((e) => e.session)).size
           const updatedKeep: MemoryEntry = {
             ...currentKeep,
             evidence: merged,
+            confidence: computeConfidence({ sessions, humanApproved: currentKeep.review === "human_approved", contradicted: false }),
             notes: [...currentKeep.notes, `${dateStr}: absorbed ${directlyAbsorbed.map((e) => e.id).join(", ")} — ${op.reason}`],
             updated_at: deps.now.toISOString(),
           }
           const path = await writeEntry(deps.storeDir, updatedKeep)
           deps.index.upsertEntry(updatedKeep, path)
+        }
+      }
+
+      // Policy absorbs: ONE enriched-keep merge proposal covering every policy-routed
+      // absorb id in this cluster — this is the convergent redesign (see module-level
+      // note above applySupersession's import). The old design cloned KEEP with
+      // supersedes pointing at the ABSORB id; approving it left keep untouched and
+      // activated a near-duplicate clone alongside it, so the next reflect run
+      // re-clustered {keep, clone} and proposed the same merge forever. Now the proposal
+      // IS keep enriched with the absorbed evidence, supersedes points at KEEP itself, and
+      // `absorbs` carries every id approveEntry must also tombstone — approval yields
+      // exactly one active entry, not two.
+      if (policyAbsorbIds.length > 0) {
+        summary.mergesPending += policyAbsorbIds.length
+        const why = keepIsPolicy ? `keep ${op.keep} is policy-type (${keepItem.entry.type})` : `absorbed member(s) are policy-type`
+        if (deps.dryRun) {
+          deps.log(`[dry-run] merge: ${policyAbsorbIds.join(",")} -> pending review (${why}), enriched replacement of ${op.keep}`)
+        } else {
+          // Re-read keep from the index so the proposal reflects any direct absorption
+          // just applied above (a mixed merge enriches keep with non-policy evidence
+          // first, then the policy proposal is built on top of that already-enriched
+          // keep — no evidence is lost by processing direct absorbs first).
+          const keepHit2 = deps.index.getById(op.keep)
+          const baseKeep = keepHit2 ? keepHit2.entry : keepItem.entry
+          const policyTargets = policyAbsorbIds.map((id) => cluster.members.find((m) => m.entry.id === id)!.entry)
+          const mergedEvidence = unionEvidenceRefs([baseKeep.evidence, ...policyTargets.map((t) => t.evidence)])
+          const sessions = new Set(mergedEvidence.map((e) => e.session)).size
+          const pending: MemoryEntry = {
+            ...baseKeep,
+            evidence: mergedEvidence,
+            confidence: computeConfidence({ sessions, humanApproved: false, contradicted: false }),
+            status: "quarantined",
+            review: "human_pending",
+            supersedes: op.keep,
+            absorbs: policyAbsorbIds,
+            promoted_from: null,
+            updated_at: deps.now.toISOString(),
+            notes: [
+              ...baseKeep.notes,
+              `${dateStr}: merge proposal: enriched replacement of ${op.keep}; absorbs ${policyAbsorbIds.join(",")}`,
+            ],
+          }
+          await writeQuarantineEntry(deps.storeDir, deps.index, pending)
         }
       }
     } catch (e) {
@@ -429,6 +480,11 @@ export async function runReflect(cfg: MemoryConfig, deps: ReflectDeps, opts?: { 
       promoted_from: entry.id,
       supersedes: null,
       superseded_by: null,
+      // entry may itself be the result of a prior approved policy merge and still carry
+      // its absorbs list — a promoted CLONE inheriting that list would re-tombstone
+      // already-superseded entries (pointing their superseded_by at this new promotion
+      // copy) the moment the promotion is approved. Never inherited.
+      absorbs: null,
       updated_at: nowIso,
       notes: [...entry.notes, `${dateStr}: pending promotion from ${entry.id} (project ${entry.project})`],
     }

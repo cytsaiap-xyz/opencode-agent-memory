@@ -97,6 +97,32 @@ export async function approveEntry(
     }
   }
 
+  // Step 2b: tombstone every id in entry.absorbs (the enriched-merge-proposal absorb list —
+  // see reflect.ts's policy-merge path), now that entry.id is final — same mechanics and
+  // same best-effort-missing-target handling as the supersedes tombstoning just above. This
+  // is what makes a policy-merge approval CONVERGE: the approved entry replaces keep
+  // (supersedes) AND every absorbed id, so the active set ends up with exactly one entry
+  // instead of a duplicate-content clone sitting alongside the original keep.
+  if (entry.absorbs && entry.absorbs.length > 0) {
+    for (const absorbId of entry.absorbs) {
+      const absorbHit = index.getById(absorbId)
+      if (absorbHit) {
+        const absorbed: MemoryEntry = {
+          ...absorbHit.entry,
+          status: "superseded",
+          superseded_by: entry.id,
+          updated_at: now.toISOString(),
+          notes: [...absorbHit.entry.notes, `${dateStr}: superseded by ${entry.id} — approved by human (absorbed by merge)`],
+        }
+        await Bun.write(absorbHit.path, serializeEntry(absorbed))
+        index.upsertEntry(absorbed, absorbHit.path)
+      } else {
+        const w = `absorb target ${absorbId} not found — approved without tombstoning`
+        warning = warning ? `${warning}; ${w}` : w
+      }
+    }
+  }
+
   // Step 4: reciprocal note on the promotion source, if any — best-effort, exactly like the
   // supersedes-target-missing case above: a source that has drifted out of the index never
   // blocks the approval, it only downgrades to a warning.

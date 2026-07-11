@@ -13,7 +13,7 @@ const tmp = () => mkdtempSync(join(tmpdir(), "amem-review-"))
 const entry = (id: string, over: Partial<MemoryEntry> = {}): MemoryEntry => ({
   id, memory_class: "semantic", type: "pitfall",
   title: "Pending Lesson", trigger: "when x", project: "proja", scope: "project",
-  domain: ["d"], volatile: false, confidence: 0.5, status: "quarantined", superseded_by: null, supersedes: null, promoted_from: null,
+  domain: ["d"], volatile: false, confidence: 0.5, status: "quarantined", superseded_by: null, supersedes: null, promoted_from: null, absorbs: null,
   review: "human_pending",
   evidence: [{ session: "ses_1", anchors: ["msg_1"], observed_at: "2026-07-11T00:00:00.000Z" }],
   provenance: { extractor: "t", prompt_hash: "sha256:aa" },

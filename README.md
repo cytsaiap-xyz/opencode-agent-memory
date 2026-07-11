@@ -343,6 +343,13 @@ aborting the whole listing.
    of the index, in which case approval still succeeds with a
    `supersede target <id> not found — approved without tombstoning` warning
    on stderr.
+5. If the entry also has an `absorbs: [<id>, ...]` field (only ever set by
+   reflect's enriched policy-merge proposals — see "Reflect" below), tombstones
+   every one of those ids too, the same way as step 4 (`status: superseded`,
+   `superseded_by: <final id>`) — a missing absorb target is a warning, not a
+   failure. This is what makes approving a merge proposal converge to a
+   single active entry instead of leaving the original `keep` still active
+   alongside the newly-approved copy.
 
 **`distill reject <id> [--reason "<text>"]`** — archives the entry in place
 (never deletes it): `status: archived`, appends a dated
@@ -404,13 +411,18 @@ to the LLM, which must pick exactly ONE of three operations:
    a `derived from: <sorted member ids>` note and the union of the members'
    evidence (deduped by session).
 2. **`merge`** — two or more members say the SAME thing in different words
-   (a write-time RECONCILE near-duplicate that slipped through). The absorbed
-   members are tombstoned into the kept entry exactly like a normal
+   (a write-time RECONCILE near-duplicate that slipped through). Non-policy
+   absorbed members are tombstoned into the kept entry exactly like a normal
    SUPERSEDE — including the **same policy gate**: if the kept entry (or an
-   absorbed one) is `decision`/`convention` type, the merge is NOT applied
-   directly; it's written to the review queue as a `SUPERSEDE_PENDING`
-   proposal instead (`distill review` / `approve` / `reject`, same as the
-   worked example above).
+   absorbed one) is `decision`/`convention` type, that absorb is NOT applied
+   directly. Instead every policy-routed absorb in the cluster is folded into
+   ONE pending proposal: content is the kept entry enriched with the
+   absorbed members' evidence (deduped by session, confidence recomputed),
+   `supersedes: <keep id>`, `absorbs: [<absorbed ids>]`. **Approving** it
+   (`distill review` / `approve` / `reject`, same as the worked example
+   above) tombstones the keep AND every id in `absorbs`, so the active set
+   converges to exactly the one enriched entry instead of leaving the
+   original keep active alongside a near-duplicate approved clone.
 3. **`none`** — the cluster is thematic coincidence only; no-op.
 
 After the cluster pass, reflect also runs a **promotion scan**: any active,
@@ -444,11 +456,26 @@ extraction/reconcile couldn't already do.
 no state of its own between runs; idempotency is entirely derived from what's
 already on disk: a re-formed cluster is skipped if an active entry's notes
 already carry its exact `derived from: <ids>` tag; a merge is skipped once
-its absorbed members are gone (or, for a policy-routed merge, once a pending
-proposal already exists for every absorbed id); a promotion is skipped once
-any non-archived entry already carries `promoted_from: <source id>`.
+its absorbed members are gone (or, for an all-policy-routed merge, once a
+pending proposal already exists for the KEEP id — the enriched proposal's
+`supersedes` points at keep, not at any absorbed id); a promotion is skipped
+once any non-archived entry already carries `promoted_from: <source id>`.
 Immediately re-running `distill reflect` after a full run should always
-report everything as skipped, with zero new files.
+report everything as skipped, with zero new files — and this holds after
+*approving* a policy merge too: keep and every absorbed id end up tombstoned,
+leaving only the one enriched entry, so there's no leftover pair left to
+re-cluster.
+
+> **Known caveat: a rejected merge/promotion proposal re-queues on the next
+> `reflect` run if its trigger condition still holds.** `reject` means "not
+> this one," not "never propose this again" — the quarantine copy becomes
+> `archived` and stays dead, but reflect re-evaluates the SAME similarity/
+> evidence signal on every run and will happily open a brand-new pending
+> proposal (a new id) if nothing about the underlying entries changed. To
+> permanently suppress a proposal, deal with what's actually triggering it —
+> archive one of the clustering members, edit its title/trigger so the
+> Jaccard similarity drops below threshold, or clear the `"promotion
+> candidate"` note by hand — rather than relying on `reject` alone.
 
 **Dry-run-first SOP.** `--dry-run` computes and logs every planned op
 (cluster ops still call the LLM — dry-run only skips the *write*) but makes

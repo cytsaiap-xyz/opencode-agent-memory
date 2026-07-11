@@ -25,6 +25,7 @@ const entry = (over: Partial<MemoryEntry> = {}): MemoryEntry => ({
   superseded_by: null,
   supersedes: null,
   promoted_from: null,
+  absorbs: null,
   review: "auto",
   evidence: [{ session: "ses_x", anchors: ["msg_1", "msg_2"], observed_at: "2026-07-10T00:00:00.000Z" }],
   provenance: { extractor: "distiller v0.1 / fake", prompt_hash: "sha256:aa" },
@@ -58,6 +59,7 @@ test("serialize/parse round-trips every field exactly", () => {
     entry({ trigger: "-42" }),
     entry({ supersedes: "mem_target" }),
     entry({ promoted_from: "mem_source" }),
+    entry({ absorbs: ["mem_a", "mem_b"] }),
   ]
   for (const e of entries) expect(parseEntry(serializeEntry(e))).toEqual(e)
 })
@@ -122,6 +124,24 @@ test("parseEntry defaults missing promoted_from to null (legacy files)", () => {
 test("parseEntry rejects wrong-typed promoted_from", () => {
   const bad = serializeEntry(entry()).replace(/^promoted_from: .*$/m, "promoted_from: 42")
   expect(() => parseEntry(bad)).toThrow(/promoted_from/)
+})
+
+test("parseEntry defaults missing absorbs to null (legacy files)", () => {
+  const serialized = serializeEntry(entry())
+  const legacy = serialized.replace(/^absorbs: .*$/m, "")
+  const parsed = parseEntry(legacy)
+  expect(parsed.absorbs).toBe(null)
+  expect(parsed).toEqual({ ...entry(), absorbs: null })
+})
+
+test("parseEntry rejects wrong-typed absorbs", () => {
+  const bad = serializeEntry(entry()).replace(/^absorbs: .*$/m, "absorbs: 42")
+  expect(() => parseEntry(bad)).toThrow(/absorbs/)
+})
+
+test("parseEntry rejects an absorbs array containing a non-string element", () => {
+  const bad = serializeEntry(entry()).replace(/^absorbs: .*$/m, 'absorbs: ["ok",1]')
+  expect(() => parseEntry(bad)).toThrow(/absorbs/)
 })
 
 test("computeConfidence follows the spec formula with clamping", () => {

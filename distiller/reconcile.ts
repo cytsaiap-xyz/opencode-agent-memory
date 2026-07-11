@@ -82,6 +82,7 @@ function entryFromCandidate(c: Candidate, meta: TranscriptMeta, deps: ReconcileD
     superseded_by: null,
     supersedes: null,
     promoted_from: null,
+    absorbs: null,
     review: "auto",
     evidence: [{ session: meta.sessionId, anchors: c.evidence.map((e) => e.message_id), observed_at: meta.timeEnd }],
     provenance: { extractor: deps.extractorLabel, prompt_hash: deps.promptHash },
@@ -233,6 +234,13 @@ export async function proposeSupersessionPending(
     status: "quarantined",
     review: "human_pending",
     supersedes: target.id,
+    // base is a clone of byId's own live entry, which may itself carry a promoted_from
+    // (it was promoted from somewhere) or an absorbs list (it was itself an enriched-merge
+    // result) — inheriting either into THIS pending proposal would leave a spurious
+    // reciprocal note or a stale absorb-tombstone list once this proposal is approved, so
+    // both are explicitly nulled out on the clone regardless of what base carried.
+    promoted_from: null,
+    absorbs: null,
     updated_at: deps.now.toISOString(),
     notes: [...base.notes, `${dateStr}: pending review — proposes to merge ${target.id} into ${byId}: ${reason}`],
   }

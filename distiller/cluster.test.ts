@@ -17,6 +17,7 @@ const entry = (over: Partial<MemoryEntry> = {}): MemoryEntry => ({
   superseded_by: null,
   supersedes: null,
   promoted_from: null,
+  absorbs: null,
   review: "auto",
   evidence: [{ session: "ses_1", anchors: ["msg_1"], observed_at: "2026-07-10T00:00:00.000Z" }],
   provenance: { extractor: "distiller v0.1 / fake", prompt_hash: "sha256:aa" },
