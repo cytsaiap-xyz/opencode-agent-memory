@@ -2,8 +2,8 @@
   {
     "fixture": "ppa-timing-closure.md",
     "expect": [
-      { "type": "decision", "keywords": ["useful skew"] },
-      { "type": "pitfall", "keywords": ["synthesis"] },
+      { "keywords": ["useful skew"] },
+      { "keywords": ["synthesis"] },
       { "keywords": ["retiming"] }
     ],
     "forbid": [

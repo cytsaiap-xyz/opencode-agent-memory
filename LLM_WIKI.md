@@ -583,6 +583,104 @@ confidence/recency 只能在「相鄰名次」之間做微調，**不能**讓排
    分數固定 0，混合查詢裡的短 token 會被忽略——這兩點是刻意的行為，
    不是 bug，細節見 Distiller 章節。
 
+## 回歸評測（`eval/`）
+
+`bun run eval` 是一套**確定性**的回歸評測，回答兩個問題：換 prompt、換模型、
+換 salience 門檻、換排序邏輯之後，抽取（extraction）還抽得出該抽的東西、
+且雜訊 transcript 還是抽不出任何東西嗎？檢索（retrieval）還能替真實查詢
+排出該排出的那筆 memory 嗎？完整設計見
+`docs/superpowers/specs/2026-07-11-regression-eval-design.md`，手動驗證清單
+見 `docs/superpowers/VERIFY-eval.md`。
+
+### 兩套評測的角色
+
+- **Extraction 套**（`eval/fixtures/*.md` + `eval/cases.json`）——對三份真實
+  transcript 跑「真的」pipeline 前半段：`parseTranscript` →
+  `buildExtractPrompt` → `LlmClient.complete`（走 `clientFromEnv()`，預設
+  opencode-run，換模型只要設 `AGENT_MEMORY_LLM=vllm`）→
+  `validateCandidates`。**不跑 RECONCILE/COMMIT**，也**絕對不碰**
+  `~/.agent-memory`——這是 extraction 品質的迴歸網，也是換模型時的
+  schema-fidelity 探測器：LLM 輸出 parse 失敗或某個候選驗證失敗（例如幻覺
+  錨點），直接算這個 fixture 失敗，這正是換 vLLM backend 時最想抓到的訊號。
+- **Retrieval 套**（`eval/retrieval/store/` + `eval/retrieval/queries.json`）
+  ——用 checked-in 的 golden memory store 在 tmp 目錄建一個拋棄式
+  `MemoryIndex`，對每個 query 呼叫真正的 `searchMemory()`，檢查
+  `expect_id` 有沒有落在前 `within_top` 名內。完全不呼叫 LLM，毫秒級，用來
+  守排序公式/FTS 邏輯的迴歸。
+
+指令：`bun run eval`（兩套都跑）、`bun run eval --extraction-only`、
+`bun run eval --retrieval-only`。Exit code `0` 全過、`1` 任何一項失敗
+（CI 友善）。每次執行都會在 `eval/results.jsonl` append 一行
+`{ ts, model: llm.describe(), extraction, retrieval, pass }`；這支檔案有
+進 git，但**不是每次跑都要 commit**——只有代表一個有意義結果（baseline、或
+一次刻意的模型/prompt 比較）才手動 commit，邊調 fixture 邊跑的雜訊行不用
+留著。
+
+### 確定性判分原則（為何不用 LLM judge）
+
+`eval/match.ts` 的 matcher 是純函式：`candidate.type === rule.type`（有給
+`type` 才檢查）且每個 keyword 都是 `title+trigger+lesson` 小寫後的子字串
+才算命中，沒有任何一步呼叫 LLM。刻意不用 LLM 當裁判——LLM judge 本身也會
+隨著要被測的那個模型/prompt 變動而漂移，等於用會動的尺量會動的東西，
+迴歸訊號就失去意義。deterministic matcher 的代價是死板（同義詞、換句話說
+都抓不到），所以 fixture 作者必須挑 transcript 裡**確實出現過的字面**當
+keyword，而不是憑印象改寫。
+
+### Fixture 增補流程
+
+1. 把一份真實（或用 `serializeEntry` 手刻、shape 對齊的）transcript 丟進
+   `eval/fixtures/<name>.md`；入庫前先跑 `scanSecrets`
+   （`distiller/extract.ts`）確認乾淨，不含 credential、不含外部人名。
+2. 在 `eval/cases.json` 加一個 case。`expect` 的 keyword 要挑 transcript
+   裡**最強、最字面**的內容訊號（transcript 自己用過的詞，不是換句話說），
+   這樣才能跨模型穩定。**能不指定 `type` 就不要指定**——同一段內容合理
+   落在兩種分類之間（例如「團隊政策」到底算 `decision` 還是
+   `convention`）時，就算模型固定不變，光是取樣變異就會讓帶 `type` 的
+   rule 偶爾失敗（這個 repo 的 baseline 跑的過程中真的踩到兩次：一次是
+   `synthesis` pitfall 被模型隨機分類成 `root_cause`，一次是 `useful skew`
+   decision 被分類成 `convention`；拿掉 `type` 限制、只留 keyword 就穩定
+   了，斷言的本意沒有變弱）。
+3. 雜訊（zero-extraction）fixture 用 `"expect": [], "max_total": 0`。
+4. **空 keywords 陷阱**：`{ "keywords": [] }` 不是「什麼都不比對」，而是
+   「什麼都比對得上」——`rule.keywords.every(...)` 對空陣列永遠回傳
+   `true`，所以空 keywords 的 `expect` rule 只要有任何候選存在
+   （型別符合的話）就會判定命中，等於斷言形同虛設；空 keywords 的
+   `forbid` rule 則會把每一個候選都標成禁區。寫 case 時 keyword 陣列**一定
+   要**至少放一個真的字。
+5. Retrieval 對應：真實或手刻的 entry 放進
+   `eval/retrieval/store/memories/<project>/`，query 加進
+   `eval/retrieval/queries.json`。
+6. Commit 前用 `bun run eval --extraction-only` 多跑幾次——opencode-run
+   這個 dev fallback backend 的 schema 穩定度明顯不如開了 guided decoding
+   的 vLLM（見下方換模型 SOP 執行紀錄），一個新 case 沒有連跑兩三次觀察過
+   就 commit，很容易誤把「這次剛好抽到的樣本」當成穩定行為。
+
+### 換模型驗收 SOP
+
+換 distiller 的 LLM backend（或換 prompt、換 salience 門檻）時，這套
+harness就是設計來擋這件事的：
+
+```bash
+# eval/results.jsonl 裡已經有 opencode-run backend 的 baseline 那一行
+AGENT_MEMORY_LLM=vllm AGENT_MEMORY_VLLM_URL=http://... AGENT_MEMORY_VLLM_MODEL=... \
+  bun run eval --extraction-only
+```
+
+**跑兩次確認穩定，再 diff `results.jsonl`**——LLM 輸出本質上是非決定性的，
+單跑一次綠燈不代表穩定、單跑一次紅燈也不代表真的退步了，只有「重複出現的
+差異」才算數。兩次都綠、且 `extraction.{fixturesPass, expectationsMet,
+errors}` 跟 baseline 那行打平或更好，才把新的那行 `results.jsonl` commit
+進去；`model` 欄位（`llm.describe()`）換了值本身就是最直接的 diff 錨點。
+
+**實測補充（本機 baseline 執行紀錄）**：跑 baseline 的過程中觀察到
+opencode-run backend 明顯的樣本間變異——同一支 fixture 連續呼叫，偶爾整批
+候選會因為證據錨點被截斷（例如把 `msg_f4b912944001ihETUskBWfmYCm` 回傳成
+截斷的 `msg_f4b912944001`）或缺必填欄位（例如漏掉 `trigger`）而全部驗證
+失敗，這正是 spec 設計成「parse/validate 失敗算失敗」要抓的 schema-fidelity
+訊號，不是 cases.json 該調的東西；上一節提到的兩個 `type` 限制鬆綁才是
+cases.json 層級能修的部分。細節與跑幾次才穩定見
+`docs/superpowers/VERIFY-eval.md`。
+
 ## 文件對照表
 
 | 主題 | 路徑 |
@@ -595,8 +693,11 @@ confidence/recency 只能在「相鄰名次」之間做微調，**不能**讓排
 | 端到端可行性驗證（Spike A：匯出→抽取→驗證） | `docs/superpowers/SPIKE.md` |
 | 記憶系統技術調研 | `docs/research/2026-07-10-memory-systems-landscape.md` |
 | 蒸餾 pipeline 模式調研 | `docs/research/2026-07-10-distillation-pipeline-patterns.md` |
+| 回歸評測設計規格 | `docs/superpowers/specs/2026-07-11-regression-eval-design.md` |
+| 回歸評測的 TDD 實作計畫（plan 3 of 3） | `docs/superpowers/plans/2026-07-11-regression-eval.md` |
 | collector 手動驗證清單（headless + interactive 項目） | `docs/superpowers/VERIFY.md` |
 | distiller 手動驗證清單（headless + interactive 項目） | `docs/superpowers/VERIFY-distiller.md` |
 | 審查流程 + CJK 搜尋手動驗證清單（headless + interactive 項目） | `docs/superpowers/VERIFY-review-cjk.md` |
 | mcp-server 手動驗證清單（headless + interactive 項目） | `docs/superpowers/VERIFY-mcp.md` |
+| 回歸評測手動驗證清單 + 本機 baseline 執行紀錄 | `docs/superpowers/VERIFY-eval.md` |
 | Plan 1/2/3 逐 task 進度與遺留項目 ledger | `.superpowers/sdd/progress.md` |

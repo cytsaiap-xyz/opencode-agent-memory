@@ -1,0 +1,2 @@
+{"ts":"2026-07-11T07:49:33.119Z","model":"opencode-run","extraction":{"fixturesPass":3,"fixturesTotal":3,"expectationsMet":4,"expectationsTotal":4,"forbiddenHits":0,"extras":4,"errors":0},"retrieval":{"pass":4,"total":4},"pass":true}
+{"ts":"2026-07-11T07:55:31.803Z","model":"opencode-run","extraction":{"fixturesPass":3,"fixturesTotal":3,"expectationsMet":4,"expectationsTotal":4,"forbiddenHits":0,"extras":4,"errors":0},"pass":true}

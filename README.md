@@ -504,6 +504,134 @@ query into tokens and picks a strategy per query:
   mild recall improvement (bm25 ranking still applies on top), not a
   regression; existing English search tests are the regression net for it.
 
+## Regression eval
+
+`eval/` is a deterministic regression harness (`bun run eval`) that answers two
+questions after any prompt, model, threshold, or ranking change: does
+extraction still pull the knowledge it should (and nothing from noise), and
+does retrieval still surface the expected memory for realistic queries? The
+judge is pure type+keyword matching — **no LLM grading anywhere in scoring**,
+because an LLM-graded eval would drift with the very model changes it's
+supposed to measure. Full design: `docs/superpowers/specs/2026-07-11-regression-eval-design.md`.
+
+An eval run never touches `~/.agent-memory`: fixtures live in the repo
+(`eval/fixtures/`, real sanitized transcripts), retrieval builds a throwaway
+index in a tmp dir from a checked-in golden store (`eval/retrieval/store/`),
+and extraction skips RECONCILE/COMMIT entirely — it only runs
+`parseTranscript → buildExtractPrompt → LlmClient.complete → validateCandidates`
+and scores the result.
+
+### Commands
+
+```bash
+bun run eval                    # both suites: extraction + retrieval
+bun run eval --extraction-only  # only the 3 fixture cases (calls the LLM, seconds-to-minutes)
+bun run eval --retrieval-only   # only the 4 golden queries (no LLM, <1s)
+```
+
+Exit code `0` when everything passes, `1` on any failure — CI-compatible.
+Each run appends one line to `eval/results.jsonl`
+(`{ ts, model: llm.describe(), extraction, retrieval, pass }`); the file is
+tracked in git but **not every run should be committed** — only append (and
+commit) a line when it represents a meaningful result you want in history
+(a baseline, or a deliberate model/prompt-change comparison). Throwaway
+verification runs while iterating don't need to be kept — the results.jsonl
+diff is a two-line comparison tool, not an audit log of every invocation.
+
+### `eval/cases.json` — extraction expectations
+
+```jsonc
+{
+  "fixture": "ppa-timing-closure.md",   // file under eval/fixtures/
+  "salience_min": 6,                    // optional, default 6
+  "expect": [                           // each rule needs >= min matching candidates
+    { "type": "decision", "keywords": ["useful skew"], "min": 1 }, // type optional
+    { "keywords": ["retiming"] }        // type omitted = match any type
+  ],
+  "forbid": [{ "keywords": ["lunch"] }],// no candidate may match any of these
+  "max_extra": 8,                       // cap on valid candidates matched by no expect rule
+  "max_total": 0                        // for noise fixtures: total valid candidates must be 0
+}
+```
+
+A candidate matches a rule iff `candidate.type === rule.type` (when given)
+AND every keyword is a case-insensitive substring of
+`title + " " + trigger + " " + lesson`. LLM output that fails to parse or
+fails per-candidate validation (bad schema, hallucinated evidence anchor)
+counts as an eval failure for that fixture — that's the schema-fidelity
+signal a model switch needs, distinct from a plain expectation miss.
+
+**Footgun: an `expect` or `forbid` rule with `"keywords": []` matches every
+candidate of the given type (or every candidate at all, if `type` is also
+omitted).** `rule.keywords.every(...)` is vacuously `true` on an empty array,
+so an empty-keywords rule isn't "match nothing" — it's "match everything."
+On `expect` this makes the rule trivially pass as long as any candidate
+exists (defeating the point of the assertion); on `forbid` it flags every
+single candidate as forbidden. Always give at least one real keyword.
+
+### `eval/retrieval/queries.json` — retrieval expectations
+
+```jsonc
+{ "query": "useful skew setup timing", "expect_id": "mem_20260710_8cd55e", "within_top": 3 }
+```
+
+Pass iff `expect_id` appears in the first `within_top` results returned by
+`searchMemory` against the golden store. Fully deterministic, zero LLM calls.
+
+### Adding a fixture
+
+1. Drop a real (or hand-written, `serializeEntry`-shaped) transcript into
+   `eval/fixtures/<name>.md`. Sanitize on check-in — no credentials, no
+   external names; run `scanSecrets` (`distiller/extract.ts`) over the body
+   first.
+2. Add a case to `eval/cases.json`. Pick `expect` keywords from the
+   **strongest, most literal content signals actually present in the
+   transcript** (a term the transcript itself uses, not a paraphrase) so the
+   case stays robust across models — see "cross-model robustness" below.
+   Prefer omitting `type` unless the classification is unambiguous; two
+   defensible types for the same content (e.g. "team policy" as `decision`
+   vs `convention`) will flake a type-constrained rule across LLM calls even
+   with a fixed model, purely from sampling variance.
+3. For a zero-extraction ("noise") fixture, use `"expect": [], "max_total": 0`.
+4. Run `bun run eval --extraction-only` a few times before committing — the
+   opencode-run dev backend (see below) is noticeably less schema-stable
+   than vLLM with guided decoding, so a case should be re-run enough times
+   to confirm it isn't accidentally pinned to one lucky sample.
+5. For retrieval, add real (or `serializeEntry`-built) entries under
+   `eval/retrieval/store/memories/<project>/` and a query in
+   `eval/retrieval/queries.json`.
+
+### Cross-model robustness
+
+Expectations must be chosen to survive a model swap: match on strong content
+signals with a generous `min`/`max_extra`, not on the exact candidate count
+or exact type a specific model happened to produce. In practice this means
+keeping `expect` rules keyword-only unless a type distinction is genuinely
+unambiguous — during this eval's own baseline run, an `expect` rule
+type-constrained to `decision` and another constrained to `pitfall` each
+flaked (matched a semantically-correct but differently-typed candidate)
+purely from run-to-run sampling variance on the *same* backend and model;
+loosening both to keyword-only (no type constraint) fixed it without
+weakening the assertion's intent.
+
+### Model-switch workflow
+
+Switching the distiller's LLM backend (or its prompt, or the salience
+threshold) is exactly what this harness exists to gate:
+
+```bash
+# baseline already in eval/results.jsonl (opencode-run backend)
+AGENT_MEMORY_LLM=vllm AGENT_MEMORY_VLLM_URL=http://... AGENT_MEMORY_VLLM_MODEL=... \
+  bun run eval --extraction-only
+```
+
+Then diff the new `eval/results.jsonl` line against the baseline line —
+`model` changes, and `extraction.{fixturesPass,expectationsMet,errors}`
+should hold or improve. Run it twice before trusting the result: LLM output
+is nondeterministic, so a single green run doesn't prove stability, and a
+single red run doesn't prove a regression — only a repeatable difference
+does. Commit the new results.jsonl line once you've confirmed it's real.
+
 ## Development
 
 ```bash
@@ -512,6 +640,7 @@ bun test          # bun:test, all collector + distiller + shared unit tests
 bun run typecheck  # tsc --noEmit
 bun run build      # bundles collector/plugin-entry.ts -> dist/agent-memory-collector.js
 bun run distill run [--project <slug>]  # run the distiller pipeline once
+bun run eval [--extraction-only|--retrieval-only]  # regression eval (see above)
 bun run mcp                              # start the mcp-server over stdio
 bun run mcp:probe "<query>" | --stats    # probe the server without an MCP host
 ```
@@ -532,11 +661,17 @@ distiller/  cli.ts (run/reindex/review/approve/reject/stats), pipeline.ts (stage
 mcp-server/ query.ts (search/rank + get/list/stats over MemoryIndex), server.ts (buildServer():
             tool registration/schemas), main.ts (stdio entrypoint), probe.ts (in-memory-transport
             CLI probe, no MCP host required)
+eval/       match.ts (deterministic candidate matcher/scorer), run.ts (harness: extraction +
+            retrieval suites, scorecard, results.jsonl history), fixtures/ (real sanitized
+            transcripts), cases.json (extraction expectations), retrieval/ (golden store +
+            queries.json), results.jsonl (append-only run history, tracked)
 docs/       design spec, research reports, superpowers specs/plans/SPIKE.md
 scripts/    install.sh
 ```
 
 See `docs/superpowers/specs/2026-07-10-agent-memory-design.md` for the full
-architecture, `docs/superpowers/VERIFY.md` for the collector's manual
-verification checklist, `docs/superpowers/VERIFY-distiller.md` for the
-distiller's, and `docs/superpowers/VERIFY-mcp.md` for the mcp-server's.
+architecture, `docs/superpowers/specs/2026-07-11-regression-eval-design.md`
+for the eval harness design, `docs/superpowers/VERIFY.md` for the collector's
+manual verification checklist, `docs/superpowers/VERIFY-distiller.md` for the
+distiller's, `docs/superpowers/VERIFY-mcp.md` for the mcp-server's, and
+`docs/superpowers/VERIFY-eval.md` for the eval harness's.
