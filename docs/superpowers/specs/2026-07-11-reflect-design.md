@@ -58,6 +58,11 @@ EXTRACT produces. Runs as `distill reflect` (scheduled weekly, or manual).
   global copy ADDS scope. On approval the source gains a note
   `promoted to <global id>`; both stay active — project-filtered queries hit
   the local entry, cross-project queries hit the global one.
+  - **Promotion tracking**: the pending global copy carries a new frontmatter
+    field `promoted_from: <source entry id>` (machine-readable, replaces
+    note-text parsing for idempotency). On `approveEntry`, if the approved
+    entry has `promoted_from`, the source entry is found and annotated with
+    `promoted to <approved id>` note for reciprocal tracing.
 - Idempotency: stateless by design — no new ledger surface. Reflect SKIPS
   clusters whose members already share a `derived from` note citing all of
   them, skips merges whose members are already superseded, and skips

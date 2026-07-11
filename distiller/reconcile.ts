@@ -81,6 +81,7 @@ function entryFromCandidate(c: Candidate, meta: TranscriptMeta, deps: ReconcileD
     status: "active",
     superseded_by: null,
     supersedes: null,
+    promoted_from: null,
     review: "auto",
     evidence: [{ session: meta.sessionId, anchors: c.evidence.map((e) => e.message_id), observed_at: meta.timeEnd }],
     provenance: { extractor: deps.extractorLabel, prompt_hash: deps.promptHash },

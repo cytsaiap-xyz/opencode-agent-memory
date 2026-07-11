@@ -60,7 +60,7 @@ const scriptedLlm = (replies: string[]): LlmClient & { calls: number } => {
 const entry = (id: string, over: Partial<MemoryEntry> = {}): MemoryEntry => ({
   id, memory_class: "semantic", type: "pitfall",
   title: `SPEF pitfall ${id}`, trigger: "after ECO", project: "proja", scope: "project",
-  domain: ["sta"], volatile: false, confidence: 0.65, status: "quarantined", superseded_by: null, supersedes: null,
+  domain: ["sta"], volatile: false, confidence: 0.65, status: "quarantined", superseded_by: null, supersedes: null, promoted_from: null,
   review: "human_pending",
   evidence: [{ session: "ses_1", anchors: ["msg_1"], observed_at: "2026-07-01T00:00:00.000Z" }],
   provenance: { extractor: "t", prompt_hash: "sha256:aa" },
