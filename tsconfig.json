@@ -9,5 +9,5 @@
     "noEmit": true,
     "types": ["bun"]
   },
-  "include": ["shared", "collector", "distiller", "mcp-server"]
+  "include": ["shared", "collector", "distiller", "mcp-server", "eval"]
 }
