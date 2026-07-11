@@ -169,7 +169,7 @@ export function buildClusters(
         // Step 4: Cap at cap members, keeping highest-confidence
         if (members.length > cap) {
           members = members
-            .sort((a, b) => b.entry.confidence - a.entry.confidence)
+            .sort((a, b) => b.entry.confidence - a.entry.confidence || a.entry.id.localeCompare(b.entry.id))
             .slice(0, cap)
         }
 
@@ -192,9 +192,14 @@ export function buildClusters(
       const memberIds = cluster.members.map(m => m.entry.id).sort()
       const key = memberIds.join(",")
 
-      // Keep the first cluster with this member set (deterministic by domain processing order)
+      // Keep the cluster with the lexicographically smallest domain
       if (!clustersByMemberKey.has(key)) {
         clustersByMemberKey.set(key, cluster)
+      } else {
+        const existing = clustersByMemberKey.get(key)!
+        if (cluster.domain < existing.domain) {
+          clustersByMemberKey.set(key, cluster)
+        }
       }
     }
   }

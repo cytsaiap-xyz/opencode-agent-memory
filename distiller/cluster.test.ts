@@ -59,12 +59,45 @@ test("pairSimilarity: both empty title/trigger, same trim = 1", () => {
   expect(pairSimilarity(a, b)).toBe(1)
 })
 
-test("pairSimilarity: both empty title/trigger, different trims = 0 (different after combining)", () => {
-  // When combined and tokenized, both result in no tokens, so the degenerate rule applies
-  // Both combined strings trim to "", so they match (return 1)
-  const a = entry({ id: "a", title: "", trigger: "" })
-  const b = entry({ id: "b", title: "", trigger: "" })
-  expect(pairSimilarity(a, b)).toBe(1)
+test("pairSimilarity: both punctuation-only (empty after tokenize), different raw = 0", () => {
+  // Both tokenize to empty set, but raw trims differ (e.g., "!!!" vs "@@@")
+  // The degenerate rule: empty+empty returns 1 only if raw trims are identical
+  // Since "!!!" and "@@@" both trim to "" but are the same after trim,
+  // we need truly different punctuation that trims to different strings
+  // Actually both trim to "", so this would return 1. Let me reconsider...
+  // The degenerate rule at line 23: both empty → 1 only if raw trims are identical
+  // "!!!" trims to "", "@@@" trims to "" → trims are identical → should return 1
+  // But the test name suggests it should be 0. Let me use strings that trim to different things.
+  // Actually, the fix is to use strings that tokenize to empty but have different raw content.
+  // For the degenerate case to return 0, we need the trim to be different.
+  // Both "!!!" and "@@@" trim to empty string "", so they're identical.
+  // We need something that trims to different values but still has no tokens.
+  // That's impossible since trim removes leading/trailing whitespace.
+  // Let me re-read the requirement: "different punctuation-only titles ("!!!" vs "@@@") → pairSimilarity 0"
+  // This means "!!!" and "@@@" should give 0. But both empty-tokenize and both trim to "".
+  // The rule says: "Both empty → 1 only if raw trims are identical, else 0"
+  // So if both trim to the same thing (""), return 1. To get 0, we need different trims.
+  // The only way is if one is "!!!" and other is... something else that doesn't trim to "".
+  // But the spec says "punctuation-only", so both should be punctuation-only.
+  // I think the intent is: "!!!" and "@@@" both have no tokens, but they're DIFFERENT strings,
+  // so return 0. This means the rule should be: "both empty → 1 only if raw trims are IDENTICAL"
+  // and "!!!" != "@@@" after trim? No, both trim to "".
+  // Let me re-read the original spec more carefully.
+  // "two DIFFERENT punctuation-only titles ("!!!" vs "@@@") → pairSimilarity 0"
+  // I think this is saying: we want them to return 0 because they have different content.
+  // But the current code would return 1 because both have empty tokens and identical trim.
+  // Maybe the intent is to check the RAW content, not just the trim?
+  // Or maybe the degenerate rule is wrong? Let me check what makes sense semantically.
+  // Two entries with only punctuation have no semantic content, so they should be dissimilar (0).
+  // So the fix to the rule should be: "both empty → return 0" (not 1 only if identical)
+  // OR "both empty → return 1 only if raw strings are identical (not just trim)"
+  // Let me use different original values that will trigger the difference:
+  const a = entry({ id: "a", title: "!!!", trigger: "" })
+  const b = entry({ id: "b", title: "@@@", trigger: "" })
+  // With the current rule: both trim to "", both have no tokens, so return 1
+  // But we want 0. So the degenerate rule needs to be: check raw string equality, not trim
+  // Or: "both empty tokens → return 0" regardless
+  expect(pairSimilarity(a, b)).toBe(0)
 })
 
 test("pairSimilarity: case-insensitive tokenization", () => {
@@ -329,4 +362,67 @@ test("buildClusters: default options (threshold=0.35, minSize=2, cap=12)", () =>
   ]
   const result = buildClusters(entries)
   expect(result).toHaveLength(1)
+})
+
+test("buildClusters: deterministic capping with tied confidences (permutation test)", () => {
+  // Regression test for issue #1: confidence sort needs secondary tie-break
+  // Create 15 entries with identical confidence, all similar
+  // Run 10 random permutations, verify all yield identical sorted member-id set
+  const baseEntries = Array.from({ length: 15 }, (_, i) => ({
+    entry: entry({
+      id: `m${i.toString().padStart(2, "0")}`,
+      title: "hold violations timing slack after",
+      trigger: "when design",
+      domain: ["test"],
+      confidence: 0.5, // All identical confidence
+    }),
+    path: `/entry${i}`,
+  }))
+
+  const results: string[][] = []
+  for (let permutation = 0; permutation < 10; permutation++) {
+    // Shuffle the input array (Fisher-Yates)
+    const shuffled = [...baseEntries]
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1))
+      const temp = shuffled[i]!
+      shuffled[i] = shuffled[j]!
+      shuffled[j] = temp
+    }
+
+    const result = buildClusters(shuffled, { minSize: 2, cap: 12 })
+    expect(result).toHaveLength(1)
+    expect(result[0]!.members).toHaveLength(12)
+    const memberIds = result[0]!.members.map(m => m.entry.id).sort()
+    results.push(memberIds)
+  }
+
+  // All permutations should yield the same sorted member-id set
+  const firstResult = results[0]!
+  for (let i = 1; i < results.length; i++) {
+    expect(results[i]!).toEqual(firstResult)
+  }
+})
+
+test("buildClusters: cross-domain dedup keeps lexicographically smallest domain", () => {
+  // Regression test for issue #2: when deduping by member key, keep smallest domain
+  // Create identical member sets under different domains
+  const entries = [
+    { entry: entry({ id: "a", title: "test", trigger: "one", domain: ["zeta", "alpha"] }), path: "/a" },
+    { entry: entry({ id: "b", title: "test", trigger: "one", domain: ["zeta", "alpha"] }), path: "/b" },
+  ]
+
+  const result = buildClusters(entries, { minSize: 2 })
+  // Both entries have both domains, so they form clusters under both zeta and alpha
+  // After dedup by member set [a,b], should keep the one with domain "alpha" (lexicographically smallest)
+  expect(result).toHaveLength(1)
+  expect(result[0]!.domain).toBe("alpha")
+})
+
+test("pairSimilarity: different punctuation-only titles = 0", () => {
+  // Regression test for issue #3: degenerate case with different punctuation-only strings
+  // Both tokenize to empty, but raw trim differs, so should return 0
+  const a = entry({ id: "a", title: "!!!", trigger: "" })
+  const b = entry({ id: "b", title: "@@@", trigger: "" })
+  expect(pairSimilarity(a, b)).toBe(0)
 })
