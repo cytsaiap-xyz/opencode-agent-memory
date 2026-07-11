@@ -81,7 +81,7 @@ test("factory returns filescan index + warns exactly once when probe not ok", ()
   idx.close()
 })
 
-test("filescan index: search/getById/stats/recordAccess/accessStats are implemented (Task 3); ledger + rebuildFrom still throw not-implemented (Task 4); close() is a no-op", async () => {
+test("filescan index: search/getById/stats/recordAccess/accessStats/ledger/rebuildFrom are all implemented; close() is a no-op", async () => {
   const dir = tmp()
   const idx = openMemoryIndex(dir, { ok: false, reason: "test" }, { warn: () => {} })
   expect(idx.mode).toBe("filescan")
@@ -90,7 +90,9 @@ test("filescan index: search/getById/stats/recordAccess/accessStats are implemen
   expect(() => idx.stats()).not.toThrow()
   expect(() => idx.recordAccess("x")).not.toThrow()
   expect(idx.accessStats("x")).toBeNull()
-  expect(() => idx.ledger.isProcessed("a", "b")).toThrow()
-  expect(() => idx.rebuildFrom(dir)).toThrow() // throws synchronously despite the Promise<number> return type
+  expect(idx.ledger.isProcessed("a", "b")).toBe(false)
+  idx.ledger.recordProcessed({ session_id: "a", content_hash: "b", extractor_model: "fake", n_candidates: 1, n_committed: 1 })
+  expect(idx.ledger.isProcessed("a", "b")).toBe(true)
+  expect(await idx.rebuildFrom(dir)).toBe(0) // no-op in filescan mode: returns current entry count, writes nothing
   expect(() => idx.close()).not.toThrow()
 })

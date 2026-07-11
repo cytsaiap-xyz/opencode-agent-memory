@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { openMemoryIndex } from "./indexes"
 import type { MemoryQuery } from "./indexes"
-import { writeEntry } from "./store"
+import { quarantinePath, serializeEntry, writeEntry } from "./store"
 import type { MemoryEntry } from "./types"
+import { PIPELINE_VERSION } from "./types"
 
 const tmp = () => mkdtempSync(join(tmpdir(), "amem-filescan-contract-"))
 
@@ -109,6 +110,15 @@ for (const mode of modes) {
       const hits = idx.search("時序")
       expect(hits.some((h) => h.entry.id === "mem_cjk")).toBe(true)
     })
+
+    test("ledger: isProcessed false before recordProcessed, true after; different hash stays false", () => {
+      expect(idx.ledger.isProcessed("ses_1", "hash_a")).toBe(false)
+
+      idx.ledger.recordProcessed({ session_id: "ses_1", content_hash: "hash_a", extractor_model: "gpt-x", n_candidates: 3, n_committed: 2 })
+
+      expect(idx.ledger.isProcessed("ses_1", "hash_a")).toBe(true)
+      expect(idx.ledger.isProcessed("ses_1", "hash_b")).toBe(false)
+    })
   })
 }
 
@@ -162,5 +172,68 @@ describe("FileScanIndex-only behavior", () => {
 
     expect(() => idx.removeEntry("mem_1")).not.toThrow()
     expect(idx.getById("mem_1")?.entry.id).toBe("mem_1") // removeEntry doesn't delete the file
+  })
+
+  // Carry-forward from Task 3 review: production writes quarantined entries via
+  // quarantinePath() + fs directly (see distiller/quarantine.ts), never through
+  // writeEntry. Assert the filescan index sees files written that same way.
+  test("an entry written directly into quarantine/ (mirroring production's quarantine write path) is visible via getById/search/stats", () => {
+    const e = entry("mem_q1", { status: "quarantined" })
+    const path = quarantinePath(dir, e.id)
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, serializeEntry(e))
+
+    expect(idx.getById("mem_q1")?.entry.id).toBe("mem_q1")
+    expect(idx.search("SPEF").some((h) => h.entry.id === "mem_q1")).toBe(true)
+    expect(idx.stats().byStatus.quarantined).toBe(1)
+  })
+
+  test("ledger.jsonl has one valid JSON line per record with all required fields", () => {
+    idx.ledger.recordProcessed({ session_id: "ses_1", content_hash: "hash_a", extractor_model: "gpt-x", n_candidates: 3, n_committed: 2 })
+    idx.ledger.recordProcessed({ session_id: "ses_2", content_hash: "hash_b", extractor_model: "gpt-x", n_candidates: 1, n_committed: 1 })
+
+    const raw = readFileSync(join(dir, "ledger.jsonl"), "utf8")
+    const lines = raw.split("\n").filter((l) => l.length > 0)
+    expect(lines.length).toBe(2)
+    for (const line of lines) {
+      const rec = JSON.parse(line)
+      expect(typeof rec.session_id).toBe("string")
+      expect(typeof rec.content_hash).toBe("string")
+      expect(rec.pipeline_version).toBe(PIPELINE_VERSION)
+      expect(typeof rec.extractor_model).toBe("string")
+      expect(typeof rec.processed_at).toBe("string")
+      expect(typeof rec.n_candidates).toBe("number")
+      expect(typeof rec.n_committed).toBe("number")
+    }
+  })
+
+  test("a torn last line in ledger.jsonl is tolerated by a fresh FileScanIndex over the same storeDir", () => {
+    idx.ledger.recordProcessed({ session_id: "ses_1", content_hash: "hash_a", extractor_model: "gpt-x", n_candidates: 1, n_committed: 1 })
+    appendFileSync(join(dir, "ledger.jsonl"), '{"session_id":"x')
+
+    const fresh = openMemoryIndex(dir, { ok: false, reason: "test" }, { warn: () => {} })
+    expect(() => fresh.ledger.isProcessed("ses_1", "hash_a")).not.toThrow()
+    expect(fresh.ledger.isProcessed("ses_1", "hash_a")).toBe(true)
+    fresh.close()
+  })
+
+  test("a second FileScanIndex instance over the same storeDir sees prior recordProcessed calls (persistence)", () => {
+    idx.ledger.recordProcessed({ session_id: "ses_1", content_hash: "hash_a", extractor_model: "gpt-x", n_candidates: 1, n_committed: 1 })
+
+    const second = openMemoryIndex(dir, { ok: false, reason: "test" }, { warn: () => {} })
+    expect(second.ledger.isProcessed("ses_1", "hash_a")).toBe(true)
+    second.close()
+  })
+
+  test("stats().sessions and lastProcessedAt reflect ledger records", () => {
+    expect(idx.stats().sessions).toBe(0)
+    expect(idx.stats().lastProcessedAt).toBeNull()
+
+    idx.ledger.recordProcessed({ session_id: "ses_1", content_hash: "hash_a", extractor_model: "gpt-x", n_candidates: 1, n_committed: 1 })
+    idx.ledger.recordProcessed({ session_id: "ses_2", content_hash: "hash_b", extractor_model: "gpt-x", n_candidates: 1, n_committed: 1 })
+
+    const s = idx.stats()
+    expect(s.sessions).toBe(2)
+    expect(s.lastProcessedAt).not.toBeNull()
   })
 })
