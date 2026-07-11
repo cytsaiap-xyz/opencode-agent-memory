@@ -19,6 +19,8 @@ export interface EvalOptions {
   resultsPath?: string | null
   now?: Date
   env?: Record<string, string | undefined>
+  runs?: number
+  passRate?: number
 }
 
 export interface EvalRunSummary {
@@ -31,6 +33,8 @@ export interface EvalRunSummary {
     forbiddenHits: number
     extras: number
     errors: number
+    runs?: number
+    fixturePassRates?: Record<string, number>
   }
   retrieval?: {
     pass: number
@@ -68,6 +72,8 @@ async function runExtraction(
   llm: LlmClient,
   out: (line: string) => void,
   salienceMin: number,
+  runs: number = 1,
+  passRate: number = 1.0,
 ): Promise<{
   fixturesPass: number
   fixturesTotal: number
@@ -76,6 +82,8 @@ async function runExtraction(
   forbiddenHits: number
   extras: number
   errors: number
+  runs: number
+  fixturePassRates: Record<string, number>
 }> {
   const casesPath = join(evalDir, "cases.json")
   const cases: ExtractionCase[] = JSON.parse(readFileSync(casesPath, "utf8"))
@@ -88,31 +96,63 @@ async function runExtraction(
   let forbiddenHits = 0
   let extras = 0
   let errors = 0
+  const fixturePassRates: Record<string, number> = {}
 
   for (const kase of cases) {
     const fixturePath = join(fixturesDir, kase.fixture)
-    try {
-      const content = readFileSync(fixturePath, "utf8")
-      const meta = parseTranscript(fixturePath, content)
 
-      const salMin = kase.salience_min ?? salienceMin
-      const validated = await extractFromTranscript(meta, llm, salMin)
-      const caseScore = scoreCase(kase, validated.valid)
+    let passes = 0
+    let fixtureErrors = 0
 
-      if (caseScore.status === "pass") fixturesPass++
-      expectationsMet += caseScore.expectationsMet
-      expectationsTotal += caseScore.expectationsTotal
-      forbiddenHits += caseScore.forbiddenHits.length
-      extras += caseScore.extras
+    for (let runIdx = 0; runIdx < runs; runIdx++) {
+      try {
+        const content = readFileSync(fixturePath, "utf8")
+        const meta = parseTranscript(fixturePath, content)
 
-      const symbol = caseScore.status === "pass" ? "✓" : "✗"
+        const salMin = kase.salience_min ?? salienceMin
+        const validated = await extractFromTranscript(meta, llm, salMin)
+        const caseScore = scoreCase(kase, validated.valid)
+
+        if (caseScore.status === "pass") passes++
+
+        // Only accumulate expectations/forbiddens on the first run for display
+        if (runIdx === 0) {
+          expectationsMet += caseScore.expectationsMet
+          expectationsTotal += caseScore.expectationsTotal
+          forbiddenHits += caseScore.forbiddenHits.length
+          extras += caseScore.extras
+        }
+      } catch (e) {
+        fixtureErrors++
+        errors++
+        if (runIdx === 0) {
+          // Only print the first error
+          const msg = e instanceof Error ? e.message : String(e)
+          out(`! ${kase.fixture} — error: ${msg}`)
+        }
+      }
+    }
+
+    const rate = passes / runs
+    fixturePassRates[kase.fixture] = rate
+    const fixturePass = rate >= passRate
+
+    if (fixturePass) fixturesPass++
+
+    const symbol = fixturePass ? "✓" : "✗"
+    const rateStr = `${passes}/${runs}`
+
+    if (runs === 1) {
       out(
-        `${symbol} ${kase.fixture} — expectations ${caseScore.expectationsMet}/${caseScore.expectationsTotal}, forbidden ${caseScore.forbiddenHits.length}, extras ${caseScore.extras}`,
+        `${symbol} ${kase.fixture} — expectations ${expectationsMet}/${expectationsTotal}, forbidden ${forbiddenHits}, extras ${extras}`,
       )
-    } catch (e) {
-      errors++
-      const msg = e instanceof Error ? e.message : String(e)
-      out(`! ${kase.fixture} — error: ${msg}`)
+    } else {
+      if (fixturePass) {
+        out(`${symbol} ${kase.fixture} — pass-rate ${rateStr}`)
+      } else {
+        const requiredStr = `${Math.ceil(passRate * runs)}/${runs}`
+        out(`${symbol} ${kase.fixture} — ${rateStr} (< required ${requiredStr})`)
+      }
     }
   }
 
@@ -124,6 +164,8 @@ async function runExtraction(
     forbiddenHits,
     extras,
     errors,
+    runs,
+    fixturePassRates,
   }
 }
 
@@ -189,14 +231,26 @@ export async function runEval(opts: EvalOptions): Promise<EvalRunSummary> {
   const now = opts.now ?? new Date()
   const env = opts.env ?? process.env
   const salienceMin = 6
+  const runs = opts.runs ?? 1
+  const passRate = opts.passRate ?? 1.0
+
+  // Validate runs parameter
+  if (runs < 1 || runs > 10 || !Number.isInteger(runs)) {
+    throw new Error(`--runs must be an integer between 1 and 10, got ${runs}`)
+  }
+
+  // Validate passRate parameter
+  if (passRate <= 0 || passRate > 1) {
+    throw new Error(`--pass-rate must be a number in (0, 1], got ${passRate}`)
+  }
 
   let extraction: EvalRunSummary["extraction"]
   let retrieval: EvalRunSummary["retrieval"]
   let pass = true
 
   if (mode === "all" || mode === "extraction") {
-    extraction = await runExtraction(opts.evalDir, llm, out, salienceMin)
-    if (extraction.errors > 0 || extraction.fixturesPass < extraction.fixturesTotal) {
+    extraction = await runExtraction(opts.evalDir, llm, out, salienceMin, runs, passRate)
+    if (extraction.fixturesPass < extraction.fixturesTotal) {
       pass = false
     }
   }
@@ -211,11 +265,16 @@ export async function runEval(opts: EvalOptions): Promise<EvalRunSummary> {
   // Print scorecard totals
   const lines: string[] = []
   if (extraction) {
-    lines.push(
+    let totalsLine =
       `Extraction: ${extraction.fixturesPass}/${extraction.fixturesTotal} fixtures passed, ` +
-        `${extraction.expectationsMet}/${extraction.expectationsTotal} expectations met, ` +
-        `${extraction.forbiddenHits} forbidden hits, ${extraction.extras} extras, ${extraction.errors} errors`,
-    )
+      `${extraction.expectationsMet}/${extraction.expectationsTotal} expectations met, ` +
+      `${extraction.forbiddenHits} forbidden hits, ${extraction.extras} extras, ${extraction.errors} errors`
+
+    if (runs > 1) {
+      totalsLine += `, runs: ${runs}`
+    }
+
+    lines.push(totalsLine)
   }
   if (retrieval) {
     lines.push(`Retrieval: ${retrieval.pass}/${retrieval.total} queries passed`)
@@ -243,6 +302,8 @@ export async function runEval(opts: EvalOptions): Promise<EvalRunSummary> {
 if (import.meta.main) {
   const args = process.argv.slice(2)
   let mode: "all" | "extraction" | "retrieval" = "all"
+  let runs = 1
+  let passRate = 1.0
 
   if (args.includes("--extraction-only")) {
     mode = "extraction"
@@ -250,7 +311,39 @@ if (import.meta.main) {
     mode = "retrieval"
   }
 
+  // Parse --runs N
+  const runsIdx = args.indexOf("--runs")
+  if (runsIdx >= 0 && runsIdx + 1 < args.length) {
+    const runsStr = args[runsIdx + 1]!
+    const parsed = parseInt(runsStr, 10)
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 10) {
+      console.error(`Error: --runs must be an integer between 1 and 10, got ${runsStr}`)
+      process.exit(1)
+    }
+    runs = parsed
+    if (mode === "retrieval") {
+      console.error("Error: --runs is only supported for extraction suite")
+      process.exit(1)
+    }
+  }
+
+  // Parse --pass-rate X
+  const passRateIdx = args.indexOf("--pass-rate")
+  if (passRateIdx >= 0 && passRateIdx + 1 < args.length) {
+    const passRateStr = args[passRateIdx + 1]!
+    const parsed = parseFloat(passRateStr)
+    if (Number.isNaN(parsed) || parsed <= 0 || parsed > 1) {
+      console.error(`Error: --pass-rate must be a number in (0, 1], got ${passRateStr}`)
+      process.exit(1)
+    }
+    passRate = parsed
+    if (mode === "retrieval") {
+      console.error("Error: --pass-rate is only supported for extraction suite")
+      process.exit(1)
+    }
+  }
+
   const evalDir = import.meta.dir
-  const summary = await runEval({ evalDir, mode })
+  const summary = await runEval({ evalDir, mode, runs, passRate })
   process.exit(summary.pass ? 0 : 1)
 }

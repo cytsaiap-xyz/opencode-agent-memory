@@ -14,6 +14,8 @@ class FakeLlm implements LlmClient {
   callCount = 0
   shouldThrow = false
   shouldReturnEmpty = false
+  // For scripted multi-run sequences: array of responses indexed by call count
+  responses: string[] | null = null
 
   describe(): string {
     return "fake"
@@ -26,6 +28,10 @@ class FakeLlm implements LlmClient {
     }
     if (this.shouldReturnEmpty) {
       return "[]"
+    }
+    // If scripted responses provided, use them (for multi-run tests)
+    if (this.responses !== null && this.callCount <= this.responses.length) {
+      return this.responses[this.callCount - 1]!
     }
     // Return a matching candidate
     return JSON.stringify([
@@ -383,5 +389,320 @@ describe("runEval", () => {
     expect(summary.pass).toBe(false)
     expect(summary.retrieval!.pass).toBe(0)
     expect(summary.retrieval!.total).toBe(1)
+  })
+
+  it("runs=3 with 2 pass + 1 fail → rate 2/3: passes at passRate 0.6, fails at default 1.0", async () => {
+    const evalDir = setupEvalDir(tmpDir)
+    const llm = new FakeLlm()
+
+    // Script 3 responses: pass, pass, fail (empty array)
+    llm.responses = [
+      // Run 1: pass
+      JSON.stringify([
+        {
+          type: "decision",
+          title: "Test Decision",
+          trigger: "Test trigger",
+          lesson: "Test lesson",
+          domain: ["test"],
+          evidence: [{ message_id: "msg_1" }],
+          salience: 8,
+          volatile: false,
+        },
+      ]),
+      // Run 2: pass
+      JSON.stringify([
+        {
+          type: "decision",
+          title: "Test Decision",
+          trigger: "Test trigger",
+          lesson: "Test lesson",
+          domain: ["test"],
+          evidence: [{ message_id: "msg_1" }],
+          salience: 8,
+          volatile: false,
+        },
+      ]),
+      // Run 3: fail (empty)
+      "[]",
+    ]
+
+    const resultsPath = join(tmpDir, "results.jsonl")
+
+    // Test with passRate 0.6 — should pass (2/3 ≈ 0.67 >= 0.6)
+    const summary1 = await runEval({
+      evalDir,
+      llm,
+      resultsPath: null,
+      mode: "extraction",
+      runs: 3,
+      passRate: 0.6,
+    })
+
+    expect(summary1.pass).toBe(true)
+    expect(summary1.extraction!.fixturesPass).toBe(1)
+    expect(summary1.extraction!.fixturesTotal).toBe(1)
+    expect(summary1.extraction!.runs).toBe(3)
+    expect(summary1.extraction!.fixturePassRates).toEqual({ "test.md": 2 / 3 })
+
+    // Reset for next test
+    llm.callCount = 0
+    llm.responses = [
+      // Run 1: pass
+      JSON.stringify([
+        {
+          type: "decision",
+          title: "Test Decision",
+          trigger: "Test trigger",
+          lesson: "Test lesson",
+          domain: ["test"],
+          evidence: [{ message_id: "msg_1" }],
+          salience: 8,
+          volatile: false,
+        },
+      ]),
+      // Run 2: pass
+      JSON.stringify([
+        {
+          type: "decision",
+          title: "Test Decision",
+          trigger: "Test trigger",
+          lesson: "Test lesson",
+          domain: ["test"],
+          evidence: [{ message_id: "msg_1" }],
+          salience: 8,
+          volatile: false,
+        },
+      ]),
+      // Run 3: fail (empty)
+      "[]",
+    ]
+
+    // Test with default passRate 1.0 — should fail (2/3 < 1.0)
+    const summary2 = await runEval({
+      evalDir,
+      llm,
+      resultsPath: null,
+      mode: "extraction",
+      runs: 3,
+      passRate: 1.0,
+    })
+
+    expect(summary2.pass).toBe(false)
+    expect(summary2.extraction!.fixturesPass).toBe(0)
+    expect(summary2.extraction!.fixturesTotal).toBe(1)
+    expect(summary2.extraction!.runs).toBe(3)
+    expect(summary2.extraction!.fixturePassRates).toEqual({ "test.md": 2 / 3 })
+  })
+
+  it("error run counted into rate and errors", async () => {
+    const evalDir = setupEvalDir(tmpDir)
+    const llm = new FakeLlm()
+
+    // Script 3 responses: pass, error, fail
+    let callCount = 0
+    llm.complete = async (req: LlmRequest): Promise<string> => {
+      callCount++
+      if (callCount === 2) {
+        throw new Error("FakeLlm intentional error on run 2")
+      }
+      if (callCount === 3) {
+        return "[]" // fail
+      }
+      // Run 1 and any other: pass
+      return JSON.stringify([
+        {
+          type: "decision",
+          title: "Test Decision",
+          trigger: "Test trigger",
+          lesson: "Test lesson",
+          domain: ["test"],
+          evidence: [{ message_id: "msg_1" }],
+          salience: 8,
+          volatile: false,
+        },
+      ])
+    }
+
+    const resultsPath = join(tmpDir, "results.jsonl")
+
+    // With passRate 0.33 (1/3 pass), should pass
+    const summary = await runEval({
+      evalDir,
+      llm,
+      resultsPath: null,
+      mode: "extraction",
+      runs: 3,
+      passRate: 0.33,
+    })
+
+    expect(summary.extraction!.runs).toBe(3)
+    expect(summary.extraction!.fixturePassRates).toEqual({ "test.md": 1 / 3 })
+    expect(summary.extraction!.errors).toBe(1)
+    expect(summary.pass).toBe(true)
+  })
+
+  it("runs=1 default identical to old behavior (regression pin)", async () => {
+    const evalDir = setupEvalDir(tmpDir)
+    const llm = new FakeLlm()
+    const resultsPath = join(tmpDir, "results.jsonl")
+    const capturedLines: string[] = []
+
+    const summary = await runEval({
+      evalDir,
+      llm,
+      resultsPath,
+      now: new Date("2026-07-11T12:00:00Z"),
+      out: (line) => capturedLines.push(line),
+    })
+
+    expect(summary.pass).toBe(true)
+    expect(summary.extraction!.fixturesPass).toBe(1)
+    expect(summary.extraction!.fixturesTotal).toBe(1)
+    expect(summary.extraction!.expectationsMet).toBe(1)
+    expect(summary.extraction!.expectationsTotal).toBe(1)
+    expect(summary.extraction!.errors).toBe(0)
+
+    // Old output format (no pass-rate shown for runs=1)
+    const extractionLine = capturedLines.find((l) => l.startsWith("✓"))
+    expect(extractionLine).toContain("expectations 1/1")
+    expect(extractionLine).not.toContain("pass-rate")
+
+    // Totals line format unchanged (no "runs: 1" mention)
+    const totalsLine = capturedLines.find((l) => l.startsWith("Extraction:"))
+    expect(totalsLine).not.toContain("runs:")
+
+    // results.jsonl still contains runs field
+    const resultsContent = (await Bun.file(resultsPath).text()).trim()
+    const result = JSON.parse(resultsContent)
+    expect(result.extraction.runs).toBe(1)
+    expect(result.extraction.fixturePassRates).toEqual({ "test.md": 1 })
+  })
+
+  it("retrieval unaffected by runs", async () => {
+    const evalDir = setupEvalDir(tmpDir)
+    const llm = new FakeLlm()
+    const resultsPath = join(tmpDir, "results.jsonl")
+
+    const summary = await runEval({
+      evalDir,
+      llm,
+      resultsPath,
+      mode: "retrieval",
+      runs: 3, // Should be ignored for retrieval
+    })
+
+    expect(llm.callCount).toBe(0)
+    expect(summary.extraction).toBeUndefined()
+    expect(summary.retrieval).toBeDefined()
+    expect(summary.retrieval!.pass).toBe(1)
+    expect(summary.retrieval!.total).toBe(1)
+
+    // Retrieval mode never writes results.jsonl
+    try {
+      await Bun.file(resultsPath).text()
+      expect.unreachable("results.jsonl should not have been written for retrieval mode")
+    } catch {
+      // Expected
+    }
+  })
+
+  it("results.jsonl extraction object contains runs and fixturePassRates", async () => {
+    const evalDir = setupEvalDir(tmpDir)
+    const llm = new FakeLlm()
+    const resultsPath = join(tmpDir, "results.jsonl")
+
+    const summary = await runEval({
+      evalDir,
+      llm,
+      resultsPath,
+      now: new Date("2026-07-11T12:00:00Z"),
+      mode: "extraction",
+      runs: 2,
+      passRate: 0.5,
+    })
+
+    expect(summary.pass).toBe(true)
+
+    const resultsContent = (await Bun.file(resultsPath).text()).trim()
+    const result = JSON.parse(resultsContent)
+
+    expect(result.extraction.runs).toBe(2)
+    expect(result.extraction.fixturePassRates).toEqual({ "test.md": 1 })
+    expect(result.model).toBe("fake")
+    expect(result.pass).toBe(true)
+  })
+
+  it("multi-run scorecard shows pass-rates for runs > 1", async () => {
+    const evalDir = setupEvalDir(tmpDir)
+    const llm = new FakeLlm()
+    const capturedLines: string[] = []
+
+    // Script 2 responses: pass, fail
+    llm.responses = [
+      // Run 1: pass
+      JSON.stringify([
+        {
+          type: "decision",
+          title: "Test Decision",
+          trigger: "Test trigger",
+          lesson: "Test lesson",
+          domain: ["test"],
+          evidence: [{ message_id: "msg_1" }],
+          salience: 8,
+          volatile: false,
+        },
+      ]),
+      // Run 2: fail (empty)
+      "[]",
+    ]
+
+    const summary = await runEval({
+      evalDir,
+      llm,
+      resultsPath: null,
+      mode: "extraction",
+      runs: 2,
+      passRate: 0.5,
+      out: (line) => capturedLines.push(line),
+    })
+
+    expect(summary.pass).toBe(true)
+
+    // Fixture line should show pass-rate format
+    const fixtureLine = capturedLines.find((l) => l.includes("test.md"))
+    expect(fixtureLine).toContain("pass-rate")
+    expect(fixtureLine).toContain("1/2")
+
+    // Totals line should include "runs: 2"
+    const totalsLine = capturedLines.find((l) => l.startsWith("Extraction:"))
+    expect(totalsLine).toContain("runs: 2")
+  })
+
+  it("multi-run failure scorecard shows < required message", async () => {
+    const evalDir = setupEvalDir(tmpDir)
+    const llm = new FakeLlm()
+    const capturedLines: string[] = []
+
+    // Script 3 responses: all fail
+    llm.responses = ["[]", "[]", "[]"]
+
+    const summary = await runEval({
+      evalDir,
+      llm,
+      resultsPath: null,
+      mode: "extraction",
+      runs: 3,
+      passRate: 0.5,
+      out: (line) => capturedLines.push(line),
+    })
+
+    expect(summary.pass).toBe(false)
+
+    // Fixture line should show < required format
+    const fixtureLine = capturedLines.find((l) => l.includes("test.md"))
+    expect(fixtureLine).toContain("✗")
+    expect(fixtureLine).toContain("0/3")
+    expect(fixtureLine).toContain("< required")
   })
 })
