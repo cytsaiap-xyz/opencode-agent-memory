@@ -4,7 +4,7 @@ import { join } from "node:path"
 import type { MemoryConfig } from "../shared/config"
 import { buildExtractPrompt, extractFromTranscript, type Candidate } from "./extract"
 import type { LlmClient } from "./llm"
-import type { MemoryIndex } from "./ledger"
+import type { MemoryQuery } from "./indexes"
 import { writeQuarantineEntry } from "./quarantine"
 import { reconcileCandidate } from "./reconcile"
 import { computeConfidence, entryId, listEntryPaths, readEntry } from "./store"
@@ -39,7 +39,7 @@ function quarantineEntry(c: Candidate, meta: TranscriptMeta, now: Date, extracto
 
 export async function runPipeline(
   cfg: MemoryConfig,
-  deps: { llm: LlmClient; index: MemoryIndex },
+  deps: { llm: LlmClient; index: MemoryQuery },
   opts: PipelineOptions = {},
 ): Promise<RunSummary> {
   const now = opts.now ?? new Date()
@@ -60,13 +60,13 @@ export async function runPipeline(
     try {
       if (!isEligible(meta, now, idleHours)) continue
       summary.eligible++
-      if (deps.index.isProcessed(meta.sessionId, meta.contentHash)) {
+      if (deps.index.ledger.isProcessed(meta.sessionId, meta.contentHash)) {
         summary.skippedProcessed++
         continue
       }
       if (meta.body.length < TRIAGE_MIN_BODY) {
         summary.triagedOut++
-        deps.index.recordProcessed({
+        deps.index.ledger.recordProcessed({
           session_id: meta.sessionId, content_hash: meta.contentHash,
           extractor_model: extractor, n_candidates: 0, n_committed: 0,
         })
@@ -101,7 +101,7 @@ export async function runPipeline(
         else summary.ops.nooped++
       }
 
-      deps.index.recordProcessed({
+      deps.index.ledger.recordProcessed({
         session_id: meta.sessionId, content_hash: meta.contentHash,
         extractor_model: extractor, n_candidates: validated.valid.length + validated.secrets.length, n_committed: committed,
       })

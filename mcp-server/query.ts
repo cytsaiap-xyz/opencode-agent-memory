@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs"
 import { join } from "node:path"
-import type { MemoryIndex, SearchHit } from "../distiller/ledger"
+import type { SearchHit } from "../distiller/ledger"
+import type { MemoryQuery } from "../distiller/indexes"
 import { listEntryPaths, parseEntry } from "../distiller/store"
 import type { MemoryEntry } from "../distiller/types"
 
@@ -17,7 +18,7 @@ export interface MemorySummary {
 
 const RECENCY_WINDOW_MS = 30 * 24 * 3600_000
 
-export function searchMemory(index: MemoryIndex, opts: SearchOpts, now: Date = new Date()): MemorySummary[] {
+export function searchMemory(index: MemoryQuery, opts: SearchOpts, now: Date = new Date()): MemorySummary[] {
   const limit = Math.min(opts.limit ?? 10, 50)
   let hits: SearchHit[] = index.search(opts.query, {
     project: opts.project,
@@ -57,7 +58,7 @@ export function searchMemory(index: MemoryIndex, opts: SearchOpts, now: Date = n
   }))
 }
 
-export function getMemory(index: MemoryIndex, id: string): (MemoryEntry & { path: string }) | null {
+export function getMemory(index: MemoryQuery, id: string): (MemoryEntry & { path: string }) | null {
   const hit = index.getById(id)
   if (!hit) return null
   try {
@@ -89,9 +90,10 @@ export function listDomains(storeDir: string, project?: string): {
   return { domains, types, projects }
 }
 
-export function memoryStats(index: MemoryIndex, storeDir: string): {
+export function memoryStats(index: MemoryQuery, storeDir: string): {
   byStatus: Record<string, number>; byType: Record<string, number>
   sessions: number; lastProcessedAt: string | null; quarantineFiles: number
+  mode: "sqlite" | "filescan"; accessAvailable: boolean
 } {
   let quarantineFiles = 0
   try {
@@ -99,5 +101,7 @@ export function memoryStats(index: MemoryIndex, storeDir: string): {
   } catch {
     // no quarantine dir
   }
-  return { ...index.stats(), quarantineFiles }
+  // index.stats() already includes accessAvailable (IndexStats); mode is added here
+  // additively so existing consumers parsing the JSON are unaffected by new fields.
+  return { ...index.stats(), quarantineFiles, mode: index.mode }
 }

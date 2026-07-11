@@ -5,7 +5,8 @@ import { tmpdir } from "node:os"
 import { extractFromTranscript } from "../distiller/extract"
 import type { LlmClient } from "../distiller/llm"
 import { clientFromEnv } from "../distiller/llm"
-import { MemoryIndex } from "../distiller/ledger"
+import { openMemoryIndex } from "../distiller/indexes"
+import { probeSqlite } from "../shared/sqliteProbe"
 import { parseTranscript } from "../distiller/transcripts"
 import { searchMemory } from "../mcp-server/query"
 import { scoreCase, type ExtractionCase } from "./match"
@@ -17,6 +18,7 @@ export interface EvalOptions {
   out?: (line: string) => void
   resultsPath?: string | null
   now?: Date
+  env?: Record<string, string | undefined>
 }
 
 export interface EvalRunSummary {
@@ -134,17 +136,23 @@ interface RetrievalQuery {
 async function runRetrieval(
   evalDir: string,
   out: (line: string) => void,
+  env: Record<string, string | undefined> = process.env,
 ): Promise<{
   pass: number
   total: number
 }> {
+  const storeDir = join(evalDir, "retrieval", "store")
+  // Probe against a scratch tmp dir (never the checked-in golden store) — in sqlite
+  // mode the real index is also built at a tmp dbPath, exactly as before; in fallback
+  // mode FileScanIndex reads storeDir live off disk, no tmp dir needed for the index
+  // itself, but rm() below still cleans it up unconditionally for symmetry.
   const tmpDir = await mkdtemp(join(tmpdir(), "eval-retrieval-"))
   try {
+    const probe = probeSqlite(tmpDir, env)
     const dbPath = join(tmpDir, "index.db")
-    const index = new MemoryIndex(dbPath)
+    const index = openMemoryIndex(storeDir, probe, probe.ok ? { dbPath } : undefined)
     try {
-      const storeDir = join(evalDir, "retrieval", "store")
-      await index.rebuildFrom(storeDir)
+      if (probe.ok) await index.rebuildFrom(storeDir)
 
       const queriesPath = join(evalDir, "retrieval", "queries.json")
       const queries: RetrievalQuery[] = JSON.parse(readFileSync(queriesPath, "utf8"))
@@ -179,6 +187,7 @@ export async function runEval(opts: EvalOptions): Promise<EvalRunSummary> {
   const out = opts.out ?? console.log
   const resultsPath = opts.resultsPath === undefined ? `${opts.evalDir}/results.jsonl` : opts.resultsPath
   const now = opts.now ?? new Date()
+  const env = opts.env ?? process.env
   const salienceMin = 6
 
   let extraction: EvalRunSummary["extraction"]
@@ -193,7 +202,7 @@ export async function runEval(opts: EvalOptions): Promise<EvalRunSummary> {
   }
 
   if (mode === "all" || mode === "retrieval") {
-    retrieval = await runRetrieval(opts.evalDir, out)
+    retrieval = await runRetrieval(opts.evalDir, out, env)
     if (retrieval.pass < retrieval.total) {
       pass = false
     }

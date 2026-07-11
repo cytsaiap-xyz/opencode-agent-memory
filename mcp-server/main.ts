@@ -1,15 +1,18 @@
 import { mkdirSync } from "node:fs"
-import { join } from "node:path"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { loadConfig } from "../shared/config"
-import { MemoryIndex } from "../distiller/ledger"
+import { probeSqlite } from "../shared/sqliteProbe"
+import { openMemoryIndex } from "../distiller/indexes"
 import { buildServer } from "./server"
 
 if (import.meta.main) {
   const cfg = loadConfig()
   mkdirSync(cfg.storeDir, { recursive: true })
-  const index = new MemoryIndex(join(cfg.storeDir, "index.db"))
-  if (index.ftsRebuildNeeded) {
+  // console.error writes to stderr — mcp paths must never write to stdout, since
+  // stdout is the JSON-RPC transport.
+  const probe = probeSqlite(cfg.storeDir, process.env)
+  const index = openMemoryIndex(cfg.storeDir, probe, { warn: console.error })
+  if (index.mode === "sqlite" && index.ftsRebuildNeeded) {
     console.error(`agent-memory: fts schema upgraded — rebuilding index from ${cfg.storeDir}`)
     await index.rebuildFrom(cfg.storeDir)
   }

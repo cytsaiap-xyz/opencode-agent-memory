@@ -1,18 +1,21 @@
 // Dev/verification probe: query the real store through the actual MCP server
 // (in-memory transport). Usage: bun mcp-server/probe.ts <query> [--project p] | --stats
 import { mkdirSync } from "node:fs"
-import { join } from "node:path"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { loadConfig } from "../shared/config"
-import { MemoryIndex } from "../distiller/ledger"
+import { probeSqlite } from "../shared/sqliteProbe"
+import { openMemoryIndex } from "../distiller/indexes"
 import { buildServer } from "./server"
 
 const args = process.argv.slice(2)
 const cfg = loadConfig()
 mkdirSync(cfg.storeDir, { recursive: true })
-const index = new MemoryIndex(join(cfg.storeDir, "index.db"))
-if (index.ftsRebuildNeeded) {
+// console.error writes to stderr — mcp paths must never write to stdout, since
+// stdout is where this probe script prints the tool result.
+const probe = probeSqlite(cfg.storeDir, process.env)
+const index = openMemoryIndex(cfg.storeDir, probe, { warn: console.error })
+if (index.mode === "sqlite" && index.ftsRebuildNeeded) {
   console.error(`agent-memory: fts schema upgraded — rebuilding index from ${cfg.storeDir}`)
   await index.rebuildFrom(cfg.storeDir)
 }

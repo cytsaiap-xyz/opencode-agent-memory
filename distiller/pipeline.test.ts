@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { loadConfig } from "../shared/config"
 import type { LlmClient } from "./llm"
-import { MemoryIndex } from "./ledger"
+import { openMemoryIndex } from "./indexes"
 import { renderIndexMd, runPipeline } from "./pipeline"
 import { entryPath, quarantinePath, serializeEntry } from "./store"
 import type { MemoryEntry } from "./types"
@@ -53,7 +53,7 @@ const setup = () => {
   const cfg = loadConfig({ AGENT_MEMORY_HOME: dir })
   mkdirSync(join(cfg.transcriptsDir, "proja"), { recursive: true })
   mkdirSync(cfg.storeDir, { recursive: true })
-  const index = new MemoryIndex(join(cfg.storeDir, "index.db"))
+  const index = openMemoryIndex(cfg.storeDir, { ok: true })
   return { dir, cfg, index }
 }
 const NOW = new Date("2026-07-11T00:00:00.000Z") // 23h after time_end -> eligible at idleHours=6
@@ -86,7 +86,7 @@ test("idle window and thin transcripts are respected", async () => {
     transcript("ses_thin", "sha256:h2", "hi").replace(PAD, "")) // short body
   const s = await runPipeline(cfg, { llm: scriptedLlm([]), index }, { now: NOW })
   expect(s.triagedOut).toBe(1)
-  expect(index.isProcessed("ses_thin", "sha256:h2")).toBe(true) // thin sessions are ledgered, not retried
+  expect(index.ledger.isProcessed("ses_thin", "sha256:h2")).toBe(true) // thin sessions are ledgered, not retried
 })
 
 test("second session on same topic reconciles as UPDATE", async () => {
@@ -131,7 +131,7 @@ test("LLM failure counts an error, leaves session unprocessed for retry", async 
   const llm: LlmClient = { describe: () => "f", complete: async () => { throw new Error("llm down") } }
   const s = await runPipeline(cfg, { llm, index }, { now: NOW })
   expect(s.errors).toBe(1)
-  expect(index.isProcessed("ses_1", "sha256:h1")).toBe(false)
+  expect(index.ledger.isProcessed("ses_1", "sha256:h1")).toBe(false)
   const retry = await runPipeline(cfg, { llm: scriptedLlm([candidateJson("Fix X", "Do Y.")]), index }, { now: NOW })
   expect(retry.ops.added).toBe(1)
 })

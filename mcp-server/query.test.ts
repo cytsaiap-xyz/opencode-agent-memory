@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { MemoryIndex } from "../distiller/ledger"
+import { openMemoryIndex } from "../distiller/indexes"
 import { serializeEntry, writeEntry } from "../distiller/store"
 import type { MemoryEntry } from "../distiller/types"
 import { getMemory, listDomains, memoryStats, searchMemory } from "./query"
@@ -25,7 +25,7 @@ const setup = async (entries: MemoryEntry[]) => {
   const dir = tmp()
   const storeDir = join(dir, "store")
   mkdirSync(storeDir, { recursive: true })
-  const index = new MemoryIndex(join(storeDir, "index.db"))
+  const index = openMemoryIndex(storeDir, { ok: true })
   for (const e of entries) index.upsertEntry(e, await writeEntry(storeDir, e))
   return { storeDir, index }
 }
@@ -158,7 +158,7 @@ test("memoryStats includes quarantine file count and lastProcessedAt", async () 
   const { storeDir, index } = await setup([entry("mem_a")])
   mkdirSync(join(storeDir, "quarantine"), { recursive: true })
   writeFileSync(join(storeDir, "quarantine", "mem_q.md"), serializeEntry(entry("mem_q", { status: "quarantined" })))
-  index.recordProcessed({ session_id: "s", content_hash: "h", extractor_model: "f", n_candidates: 1, n_committed: 1 })
+  index.ledger.recordProcessed({ session_id: "s", content_hash: "h", extractor_model: "f", n_candidates: 1, n_committed: 1 })
   const s = memoryStats(index, storeDir)
   expect(s.quarantineFiles).toBe(1)
   expect(s.byStatus.active).toBe(1)

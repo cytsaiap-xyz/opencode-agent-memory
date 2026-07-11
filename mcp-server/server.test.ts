@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
-import { MemoryIndex } from "../distiller/ledger"
+import { openMemoryIndex } from "../distiller/indexes"
 import { writeEntry, serializeEntry, readEntry } from "../distiller/store"
 import type { MemoryEntry } from "../distiller/types"
 import { buildServer } from "./server"
@@ -25,7 +25,7 @@ const setup = async () => {
   const dir = mkdtempSync(join(tmpdir(), "amem-srv-"))
   const storeDir = join(dir, "store")
   mkdirSync(storeDir, { recursive: true })
-  const index = new MemoryIndex(join(storeDir, "index.db"))
+  const index = openMemoryIndex(storeDir, { ok: true })
   const e = entry("mem_a")
   const path = await writeEntry(storeDir, e)
   index.upsertEntry(e, path)
@@ -72,6 +72,8 @@ test("list_domains and memory_stats return JSON shapes", async () => {
   const stats = JSON.parse(textOf(await client.callTool({ name: "memory_stats", arguments: {} })))
   expect(stats.byStatus.active).toBe(1)
   expect(stats.quarantineFiles).toBe(0)
+  expect(stats.mode).toBe("sqlite")
+  expect(stats.accessAvailable).toBe(true)
 })
 
 test("server is read-only over the store content", async () => {

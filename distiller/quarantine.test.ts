@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { MemoryIndex } from "./ledger"
+import { openMemoryIndex } from "./indexes"
 import { quarantinePath, serializeEntry } from "./store"
 import { writeQuarantineEntry } from "./quarantine"
 import type { MemoryEntry } from "./types"
@@ -25,7 +25,7 @@ const setup = () => {
   const dir = tmp()
   const storeDir = join(dir, "store")
   mkdirSync(storeDir, { recursive: true })
-  const index = new MemoryIndex(join(storeDir, "index.db"))
+  const index = openMemoryIndex(storeDir, { ok: true })
   return { storeDir, index }
 }
 

@@ -1,8 +1,9 @@
-import { join } from "node:path"
 import { mkdirSync } from "node:fs"
+import { join } from "node:path"
 import { loadConfig } from "../shared/config"
+import { probeSqlite } from "../shared/sqliteProbe"
 import { clientFromEnv, type LlmClient } from "./llm"
-import { MemoryIndex } from "./ledger"
+import { openMemoryIndex, type MemoryQuery } from "./indexes"
 import { runPipeline } from "./pipeline"
 import { approveEntry, rejectEntry } from "./reviewops"
 
@@ -10,12 +11,15 @@ export interface CliDeps { llm?: LlmClient; out?: (line: string) => void; err?: 
 
 const USAGE = "usage: distiller <run [--project <slug>] | reindex | review | approve <id> | reject <id> [--reason <text>] | stats>"
 
-async function openIndex(cfg: { storeDir: string }, onError?: (msg: string) => void): Promise<MemoryIndex> {
-  const index = new MemoryIndex(join(cfg.storeDir, "index.db"))
-  if (index.ftsRebuildNeeded) {
-    const msg = `agent-memory: fts schema upgraded — rebuilding index from ${cfg.storeDir}`
-    if (onError) onError(msg)
-    else console.error(msg)
+async function openIndex(
+  cfg: { storeDir: string },
+  env: Record<string, string | undefined>,
+  warn: (msg: string) => void,
+): Promise<MemoryQuery> {
+  const probe = probeSqlite(cfg.storeDir, env)
+  const index = openMemoryIndex(cfg.storeDir, probe, { warn })
+  if (index.mode === "sqlite" && index.ftsRebuildNeeded) {
+    warn(`agent-memory: fts schema upgraded — rebuilding index from ${cfg.storeDir}`)
     await index.rebuildFrom(cfg.storeDir)
   }
   return index
@@ -49,7 +53,7 @@ export async function runCli(
         if (pi >= 0 && !project) throw new Error("--project needs a value")
         const llm = deps.llm ?? clientFromEnv(env)
         mkdirSync(cfg.storeDir, { recursive: true })
-        const index = await openIndex(cfg, err)
+        const index = await openIndex(cfg, env, err)
         try {
           const s = await runPipeline(cfg, { llm, index }, { project, idleHours, salienceMin })
           out(
@@ -64,8 +68,12 @@ export async function runCli(
       }
       case "reindex": {
         mkdirSync(cfg.storeDir, { recursive: true })
-        const index = await openIndex(cfg, err)
+        const index = await openIndex(cfg, env, err)
         try {
+          if (index.mode === "filescan") {
+            out("markdown is the store — nothing to rebuild (filescan mode)")
+            return 0
+          }
           out(`reindexed ${await index.rebuildFrom(cfg.storeDir)} memories`)
           return 0
         } finally {
@@ -74,7 +82,7 @@ export async function runCli(
       }
       case "review": {
         mkdirSync(cfg.storeDir, { recursive: true })
-        const index = await openIndex(cfg, err)
+        const index = await openIndex(cfg, env, err)
         try {
           const { listEntryPaths, readEntry } = await import("./store")
           const { readdirSync } = await import("node:fs")
@@ -125,7 +133,7 @@ export async function runCli(
         const id = rest[0]
         if (!id) throw new Error("approve needs an <id> argument")
         mkdirSync(cfg.storeDir, { recursive: true })
-        const index = await openIndex(cfg, err)
+        const index = await openIndex(cfg, env, err)
         try {
           const result = await approveEntry(cfg.storeDir, index, id)
           if (result.warning) err(`distiller: ${result.warning}`)
@@ -143,7 +151,7 @@ export async function runCli(
         const reason = ri >= 0 ? rest[ri + 1] : undefined
         if (ri >= 0 && !reason) throw new Error("--reason needs a value")
         mkdirSync(cfg.storeDir, { recursive: true })
-        const index = await openIndex(cfg, err)
+        const index = await openIndex(cfg, env, err)
         try {
           const rejected = await rejectEntry(cfg.storeDir, index, id, reason)
           out(`rejected ${rejected.id}`)
@@ -154,7 +162,7 @@ export async function runCli(
       }
       case "stats": {
         mkdirSync(cfg.storeDir, { recursive: true })
-        const index = await openIndex(cfg, err)
+        const index = await openIndex(cfg, env, err)
         try {
           const s = index.stats()
           out(`memories: ${JSON.stringify(s.byStatus)}; types: ${JSON.stringify(s.byType)}; sessions processed: ${s.sessions}`)

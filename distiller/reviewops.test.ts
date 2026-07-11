@@ -2,7 +2,8 @@ import { expect, test } from "bun:test"
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { MemoryIndex } from "./ledger"
+import { openMemoryIndex } from "./indexes"
+import type { MemoryQuery } from "./indexes"
 import { approveEntry, rejectEntry } from "./reviewops"
 import { entryPath, quarantinePath, serializeEntry } from "./store"
 import type { MemoryEntry } from "./types"
@@ -25,11 +26,11 @@ const setup = () => {
   const dir = tmp()
   const storeDir = join(dir, "store")
   mkdirSync(storeDir, { recursive: true })
-  const index = new MemoryIndex(join(storeDir, "index.db"))
+  const index = openMemoryIndex(storeDir, { ok: true })
   return { storeDir, index }
 }
 
-const seedQuarantined = (storeDir: string, index: MemoryIndex, e: MemoryEntry): string => {
+const seedQuarantined = (storeDir: string, index: MemoryQuery, e: MemoryEntry): string => {
   const path = quarantinePath(storeDir, e.id)
   mkdirSync(join(storeDir, "quarantine"), { recursive: true })
   writeFileSync(path, serializeEntry(e))
@@ -37,7 +38,7 @@ const seedQuarantined = (storeDir: string, index: MemoryIndex, e: MemoryEntry): 
   return path
 }
 
-const seedActive = (storeDir: string, index: MemoryIndex, e: MemoryEntry): string => {
+const seedActive = (storeDir: string, index: MemoryQuery, e: MemoryEntry): string => {
   const path = entryPath(storeDir, e)
   mkdirSync(join(storeDir, "memories", e.project), { recursive: true })
   writeFileSync(path, serializeEntry(e))

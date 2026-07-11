@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { dirname } from "node:path"
-import type { MemoryIndex } from "./ledger"
+import type { MemoryQuery } from "./indexes"
 import { quarantinePath, serializeEntry } from "./store"
 import type { MemoryEntry } from "./types"
 
@@ -16,7 +16,7 @@ import type { MemoryEntry } from "./types"
  * file, making the active memory vanish from search. Matches addEntry's
  * uniquify convention in reconcile.ts.
  */
-export async function writeQuarantineEntry(storeDir: string, index: MemoryIndex, e: MemoryEntry): Promise<MemoryEntry> {
+export async function writeQuarantineEntry(storeDir: string, index: MemoryQuery, e: MemoryEntry): Promise<MemoryEntry> {
   let qe = e
   let qPath = quarantinePath(storeDir, qe.id)
   if (existsSync(qPath) || index.getById(qe.id) !== null) {

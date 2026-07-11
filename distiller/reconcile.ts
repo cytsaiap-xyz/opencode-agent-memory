@@ -3,7 +3,7 @@ import { join } from "node:path"
 import type { Candidate } from "./extract"
 import { stripFences } from "./extract"
 import type { LlmClient } from "./llm"
-import type { MemoryIndex } from "./ledger"
+import type { MemoryQuery } from "./indexes"
 import { writeQuarantineEntry } from "./quarantine"
 import { computeConfidence, entryId, parseEntry, writeEntry } from "./store"
 import type { TranscriptMeta } from "./transcripts"
@@ -57,7 +57,7 @@ export function parseReconcileOp(raw: string, neighborIds: string[]): ReconcileO
 }
 
 export interface ReconcileDeps {
-  llm: LlmClient; index: MemoryIndex; storeDir: string; now: Date
+  llm: LlmClient; index: MemoryQuery; storeDir: string; now: Date
   extractorLabel: string; promptHash: string
 }
 

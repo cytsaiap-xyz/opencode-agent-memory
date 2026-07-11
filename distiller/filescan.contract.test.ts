@@ -236,4 +236,29 @@ describe("FileScanIndex-only behavior", () => {
     expect(s.sessions).toBe(2)
     expect(s.lastProcessedAt).not.toBeNull()
   })
+
+  // Carry-forward from Task 4 review: a long-lived process (mcp-server) holds a
+  // FileLedger whose lazy-loaded Set can go stale if the nightly distiller — a
+  // SEPARATE process — appends to ledger.jsonl in the background. Instance A must
+  // pick up instance B's writes on its NEXT isProcessed()/stats() call, not just on
+  // fresh construction (that was already covered by the "second instance sees prior
+  // writes" test above — this one is about an instance that was ALREADY loaded
+  // before the external write happened).
+  test("an already-loaded instance sees a record written by a second instance afterward (mtime-triggered reload)", () => {
+    // Force instance A (idx, from beforeEach) to load and cache its (empty) state.
+    expect(idx.stats().sessions).toBe(0)
+    expect(idx.ledger.isProcessed("ses_ext", "hash_ext")).toBe(false)
+
+    // A second instance over the same storeDir — simulating a separate process —
+    // writes a record instance A never saw.
+    const writer = openMemoryIndex(dir, { ok: false, reason: "test" }, { warn: () => {} })
+    writer.ledger.recordProcessed({ session_id: "ses_ext", content_hash: "hash_ext", extractor_model: "gpt-x", n_candidates: 1, n_committed: 1 })
+    writer.close()
+
+    // Instance A (already loaded, never reconstructed) must see the external write
+    // on its next call — both isProcessed() and stats().
+    expect(idx.ledger.isProcessed("ses_ext", "hash_ext")).toBe(true)
+    expect(idx.stats().sessions).toBe(1)
+    expect(idx.stats().lastProcessedAt).not.toBeNull()
+  })
 })

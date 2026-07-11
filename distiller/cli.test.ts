@@ -208,7 +208,7 @@ test("review -> approve -> review empty -> re-approve fails; reject unknown id i
   // Seed a quarantined pending entry directly (no LLM run needed).
   mkdirSync(join(dir, "store", "quarantine"), { recursive: true })
   const { serializeEntry } = await import("./store")
-  const { MemoryIndex } = await import("./ledger")
+  const { openMemoryIndex } = await import("./indexes")
   const pending: MemoryEntry = {
     id: "mem_20260710_pend01",
     memory_class: "semantic",
@@ -233,7 +233,7 @@ test("review -> approve -> review empty -> re-approve fails; reject unknown id i
   }
   const qPath = join(dir, "store", "quarantine", `${pending.id}.md`)
   writeFileSync(qPath, serializeEntry(pending))
-  const seedIndex = new MemoryIndex(join(dir, "store", "index.db"))
+  const seedIndex = openMemoryIndex(join(dir, "store"), { ok: true })
   seedIndex.upsertEntry(pending, qPath)
   seedIndex.close()
 

@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, readFileSync, readdirSync } from "node:fs"
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs"
 import { basename, dirname, join } from "node:path"
 import { MemoryIndex } from "./ledger"
 import type { SearchHit } from "./ledger"
@@ -47,6 +47,9 @@ export interface IndexStats {
 
 export interface MemoryQuery {
   readonly mode: "sqlite" | "filescan"
+  // Only meaningful in sqlite mode (undefined in filescan — there's no fts schema to
+  // migrate). Entry points must guard with `mode === "sqlite"` before reading this.
+  readonly ftsRebuildNeeded?: boolean
   search(query: string, opts?: { project?: string; type?: string; status?: string; minConfidence?: number; limit?: number }): SearchHit[]
   getById(id: string): SearchHit | null
   upsertEntry(e: MemoryEntry, path: string): void // filescan: no-op
@@ -68,9 +71,11 @@ export class SqliteIndex implements MemoryQuery {
   readonly mode = "sqlite" as const
   private inner: MemoryIndex
   readonly ledger: LedgerFacet
+  readonly ftsRebuildNeeded: boolean
 
   constructor(dbPath: string) {
     this.inner = new MemoryIndex(dbPath)
+    this.ftsRebuildNeeded = this.inner.ftsRebuildNeeded
     const inner = this.inner
     this.ledger = {
       isProcessed(sessionId, contentHash) {
@@ -141,6 +146,14 @@ const ledgerKey = (sessionId: string, contentHash: string, pipelineVersion: stri
  * without re-reading the file. A torn/unparseable FINAL line (crash mid-append) is
  * tolerated silently; any other unparseable line is skipped with a single
  * aggregate stderr warning for the whole load.
+ *
+ * Long-lived processes (mcp-server) can outlive an external writer's append — e.g. the
+ * nightly distiller running as a separate process appends to the same ledger.jsonl
+ * while this instance sits idle. To avoid serving stale isProcessed()/stats() answers
+ * for the rest of the process lifetime, every entry point (ensureLoaded, called from
+ * isProcessed/recordProcessed/count/lastProcessedAt) cheaply stats the file's mtime
+ * and reloads whenever it has moved since the last load — a single statSync per call,
+ * not a re-parse unless the file actually changed.
  */
 class FileLedger implements LedgerFacet {
   private readonly path: string
@@ -148,14 +161,26 @@ class FileLedger implements LedgerFacet {
   private keys: Set<string> | null = null
   private recordCount = 0
   private maxProcessedAt: string | null = null
+  private lastMtimeMs: number | null = null
 
   constructor(storeDir: string, warn: (line: string) => void = console.error) {
     this.path = join(storeDir, "ledger.jsonl")
     this.warn = warn
   }
 
+  private currentMtimeMs(): number | null {
+    try {
+      return statSync(this.path).mtimeMs
+    } catch {
+      return null
+    }
+  }
+
   private ensureLoaded(): void {
-    if (this.keys !== null) return
+    const mtime = this.currentMtimeMs()
+    // Already loaded and the file hasn't changed underneath us (including the "still
+    // doesn't exist" case, mtime === null === lastMtimeMs) — skip the re-parse.
+    if (this.keys !== null && mtime === this.lastMtimeMs) return
     const keys = new Set<string>()
     let maxProcessedAt: string | null = null
     let raw: string
@@ -166,6 +191,7 @@ class FileLedger implements LedgerFacet {
       this.keys = keys
       this.recordCount = 0
       this.maxProcessedAt = null
+      this.lastMtimeMs = mtime
       return
     }
     const lines = raw.split("\n").filter((l) => l.length > 0)
@@ -202,6 +228,7 @@ class FileLedger implements LedgerFacet {
     this.keys = keys
     this.recordCount = keys.size
     this.maxProcessedAt = maxProcessedAt
+    this.lastMtimeMs = mtime
   }
 
   isProcessed(sessionId: string, contentHash: string): boolean {
@@ -224,13 +251,17 @@ class FileLedger implements LedgerFacet {
     appendFileSync(this.path, JSON.stringify(rec) + "\n")
 
     // Same-process read-your-writes: update in-memory state immediately rather
-    // than relying on a re-read of the file we just appended to.
+    // than relying on a re-read of the file we just appended to. Also refresh the
+    // mtime bookmark to match what we just wrote, so the next ensureLoaded() call
+    // (from this same instance) doesn't pay for a redundant reload of the file we
+    // already have fully reflected in memory.
     const key = ledgerKey(rec.session_id, rec.content_hash, rec.pipeline_version)
     if (!this.keys!.has(key)) {
       this.keys!.add(key)
       this.recordCount = this.keys!.size
     }
     if (this.maxProcessedAt === null || rec.processed_at > this.maxProcessedAt) this.maxProcessedAt = rec.processed_at
+    this.lastMtimeMs = this.currentMtimeMs()
   }
 
   count(): number {

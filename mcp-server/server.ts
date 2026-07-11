@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
-import type { MemoryIndex } from "../distiller/ledger"
+import type { MemoryQuery } from "../distiller/indexes"
 import { getMemory, listDomains, memoryStats, searchMemory } from "./query"
 
 const MEMORY_TYPES = ["decision", "root_cause", "pitfall", "know_how", "convention", "workflow"] as const
@@ -18,7 +18,7 @@ const guarded = <A>(fn: (args: A) => ToolResult) => async (args: A): Promise<Too
   }
 }
 
-export function buildServer(deps: { index: MemoryIndex; storeDir: string }): McpServer {
+export function buildServer(deps: { index: MemoryQuery; storeDir: string }): McpServer {
   const server = new McpServer({ name: "agent-memory", version: "0.1.0" })
 
   server.registerTool(

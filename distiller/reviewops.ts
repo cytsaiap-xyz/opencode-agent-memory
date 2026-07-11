@@ -1,7 +1,8 @@
 import { existsSync } from "node:fs"
 import { unlink } from "node:fs/promises"
 import { join, sep } from "node:path"
-import type { MemoryIndex, SearchHit } from "./ledger"
+import type { SearchHit } from "./ledger"
+import type { MemoryQuery } from "./indexes"
 import { computeConfidence, entryPath, serializeEntry, writeEntry } from "./store"
 import type { MemoryEntry } from "./types"
 
@@ -12,7 +13,7 @@ export interface ApproveResult {
   warning?: string
 }
 
-function requirePending(index: MemoryIndex, id: string): SearchHit {
+function requirePending(index: MemoryQuery, id: string): SearchHit {
   const hit = index.getById(id)
   if (!hit) throw new Error(`memory ${id} not found`)
   if (hit.entry.review !== "human_pending" || hit.entry.status === "archived")
@@ -22,7 +23,7 @@ function requirePending(index: MemoryIndex, id: string): SearchHit {
 
 export async function approveEntry(
   storeDir: string,
-  index: MemoryIndex,
+  index: MemoryQuery,
   id: string,
   now: Date = new Date(),
 ): Promise<ApproveResult> {
@@ -101,7 +102,7 @@ export async function approveEntry(
 
 export async function rejectEntry(
   storeDir: string,
-  index: MemoryIndex,
+  index: MemoryQuery,
   id: string,
   reason?: string,
   now: Date = new Date(),

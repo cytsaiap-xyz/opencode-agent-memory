@@ -3,7 +3,8 @@ import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync } from "node:fs
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { LlmClient } from "./llm"
-import { MemoryIndex } from "./ledger"
+import { openMemoryIndex } from "./indexes"
+import type { MemoryQuery } from "./indexes"
 import { parseReconcileOp, reconcileCandidate } from "./reconcile"
 import { entryId, entryPath, readEntry, writeEntry } from "./store"
 import type { Candidate } from "./extract"
@@ -43,12 +44,12 @@ const setup = async (seed?: MemoryEntry) => {
   const dir = tmp()
   const storeDir = join(dir, "store")
   mkdirSync(storeDir, { recursive: true })
-  const index = new MemoryIndex(join(storeDir, "index.db"))
+  const index = openMemoryIndex(storeDir, { ok: true })
   if (seed) index.upsertEntry(seed, await writeEntry(storeDir, seed))
   return { storeDir, index }
 }
 
-const deps = (o: { llm: LlmClient; index: MemoryIndex; storeDir: string }) => ({
+const deps = (o: { llm: LlmClient; index: MemoryQuery; storeDir: string }) => ({
   ...o, now: new Date("2026-07-11T02:00:00.000Z"), extractorLabel: "distiller v0.1 / fake", promptHash: "sha256:pp",
 })
 
