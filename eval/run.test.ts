@@ -607,6 +607,115 @@ describe("runEval", () => {
     }
   })
 
+  it("FIX 1: expectation counters accumulated across all runs", async () => {
+    const evalDir = setupEvalDir(tmpDir)
+    const llm = new FakeLlm()
+
+    // Script 3 responses: all pass (so expectationsMet should be 3x baseline)
+    llm.responses = [
+      // Run 1: pass (1 expectation met)
+      JSON.stringify([
+        {
+          type: "decision",
+          title: "Test Decision",
+          trigger: "Test trigger",
+          lesson: "Test lesson",
+          domain: ["test"],
+          evidence: [{ message_id: "msg_1" }],
+          salience: 8,
+          volatile: false,
+        },
+      ]),
+      // Run 2: pass
+      JSON.stringify([
+        {
+          type: "decision",
+          title: "Test Decision",
+          trigger: "Test trigger",
+          lesson: "Test lesson",
+          domain: ["test"],
+          evidence: [{ message_id: "msg_1" }],
+          salience: 8,
+          volatile: false,
+        },
+      ]),
+      // Run 3: pass
+      JSON.stringify([
+        {
+          type: "decision",
+          title: "Test Decision",
+          trigger: "Test trigger",
+          lesson: "Test lesson",
+          domain: ["test"],
+          evidence: [{ message_id: "msg_1" }],
+          salience: 8,
+          volatile: false,
+        },
+      ]),
+    ]
+
+    const summary = await runEval({
+      evalDir,
+      llm,
+      resultsPath: null,
+      mode: "extraction",
+      runs: 3,
+    })
+
+    // With 2 expectations per fixture (from cases.json) and 3 runs:
+    // expectationsTotal should be 2 * 3 = 6 (each run contributes 2)
+    // expectationsMet should also be 3 (1 expectation met per run * 3 runs)
+    expect(summary.extraction!.expectationsTotal).toBe(3) // 1 expectation per run * 3 runs
+    expect(summary.extraction!.expectationsMet).toBe(3) // 1 met per run * 3 runs
+  })
+
+  it("FIX 2: error diagnostics printed for every run with run prefix", async () => {
+    const evalDir = setupEvalDir(tmpDir)
+    const llm = new FakeLlm()
+    const capturedLines: string[] = []
+
+    // Script 3 responses: pass, error on run 2, pass
+    let callCount = 0
+    llm.complete = async (req: LlmRequest): Promise<string> => {
+      callCount++
+      if (callCount === 2) {
+        throw new Error("FakeLlm intentional error on run 2")
+      }
+      // Run 1 and 3: pass
+      return JSON.stringify([
+        {
+          type: "decision",
+          title: "Test Decision",
+          trigger: "Test trigger",
+          lesson: "Test lesson",
+          domain: ["test"],
+          evidence: [{ message_id: "msg_1" }],
+          salience: 8,
+          volatile: false,
+        },
+      ])
+    }
+
+    const summary = await runEval({
+      evalDir,
+      llm,
+      resultsPath: null,
+      mode: "extraction",
+      runs: 3,
+      passRate: 0.5,
+      out: (line) => capturedLines.push(line),
+    })
+
+    // Error on run 2 should be visible
+    expect(summary.extraction!.errors).toBe(1)
+
+    // Output should contain error line with "[run 2/3]" prefix
+    const errorLine = capturedLines.find((l) => l.startsWith("!"))
+    expect(errorLine).toBeDefined()
+    expect(errorLine).toContain("[run 2/3]")
+    expect(errorLine).toContain("FakeLlm intentional error on run 2")
+  })
+
   it("results.jsonl extraction object contains runs and fixturePassRates", async () => {
     const evalDir = setupEvalDir(tmpDir)
     const llm = new FakeLlm()

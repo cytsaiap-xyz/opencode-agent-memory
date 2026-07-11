@@ -115,21 +115,18 @@ async function runExtraction(
 
         if (caseScore.status === "pass") passes++
 
-        // Only accumulate expectations/forbiddens on the first run for display
-        if (runIdx === 0) {
-          expectationsMet += caseScore.expectationsMet
-          expectationsTotal += caseScore.expectationsTotal
-          forbiddenHits += caseScore.forbiddenHits.length
-          extras += caseScore.extras
-        }
+        // Accumulate expectations/forbiddens across all runs
+        expectationsMet += caseScore.expectationsMet
+        expectationsTotal += caseScore.expectationsTotal
+        forbiddenHits += caseScore.forbiddenHits.length
+        extras += caseScore.extras
       } catch (e) {
         fixtureErrors++
         errors++
-        if (runIdx === 0) {
-          // Only print the first error
-          const msg = e instanceof Error ? e.message : String(e)
-          out(`! ${kase.fixture} — error: ${msg}`)
-        }
+        // Print error for every run, prefixed with run number when runs > 1
+        const msg = e instanceof Error ? e.message : String(e)
+        const runPrefix = runs > 1 ? ` [run ${runIdx + 1}/${runs}]` : ""
+        out(`! ${kase.fixture}${runPrefix} — error: ${msg}`)
       }
     }
 
