@@ -81,15 +81,16 @@ test("factory returns filescan index + warns exactly once when probe not ok", ()
   idx.close()
 })
 
-test("filescan index throws not-implemented for unimplemented methods but close() is a no-op", () => {
+test("filescan index: search/getById/stats/recordAccess/accessStats are implemented (Task 3); ledger + rebuildFrom still throw not-implemented (Task 4); close() is a no-op", async () => {
   const dir = tmp()
   const idx = openMemoryIndex(dir, { ok: false, reason: "test" }, { warn: () => {} })
   expect(idx.mode).toBe("filescan")
-  expect(() => idx.search("x")).toThrow()
-  expect(() => idx.getById("x")).toThrow()
-  expect(() => idx.stats()).toThrow()
-  expect(() => idx.recordAccess("x")).toThrow()
-  expect(() => idx.accessStats("x")).toThrow()
+  expect(() => idx.search("x")).not.toThrow()
+  expect(idx.getById("x")).toBeNull()
+  expect(() => idx.stats()).not.toThrow()
+  expect(() => idx.recordAccess("x")).not.toThrow()
+  expect(idx.accessStats("x")).toBeNull()
   expect(() => idx.ledger.isProcessed("a", "b")).toThrow()
+  expect(() => idx.rebuildFrom(dir)).toThrow() // throws synchronously despite the Promise<number> return type
   expect(() => idx.close()).not.toThrow()
 })
