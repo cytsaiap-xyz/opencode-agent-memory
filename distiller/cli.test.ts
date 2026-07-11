@@ -79,6 +79,51 @@ test("unknown command and bad env are friendly errors", async () => {
   expect(err.join("\n")).toContain("AGENT_MEMORY_IDLE_HOURS")
 })
 
+test("bad AGENT_MEMORY_TRIAGE / AGENT_MEMORY_EXTRACT_RUNS / AGENT_MEMORY_JUDGES are friendly errors", async () => {
+  const { env, err, deps } = setup()
+  err.length = 0
+  expect(await runCli(["run"], { ...env, AGENT_MEMORY_TRIAGE: "vibes" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_TRIAGE")
+
+  err.length = 0
+  expect(await runCli(["run"], { ...env, AGENT_MEMORY_EXTRACT_RUNS: "0" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_EXTRACT_RUNS")
+
+  err.length = 0
+  expect(await runCli(["run"], { ...env, AGENT_MEMORY_EXTRACT_RUNS: "6" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_EXTRACT_RUNS")
+
+  err.length = 0
+  expect(await runCli(["run"], { ...env, AGENT_MEMORY_EXTRACT_RUNS: "1.5" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_EXTRACT_RUNS")
+
+  err.length = 0
+  expect(await runCli(["run"], { ...env, AGENT_MEMORY_JUDGES: "-1" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_JUDGES")
+
+  err.length = 0
+  expect(await runCli(["run"], { ...env, AGENT_MEMORY_JUDGES: "6" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_JUDGES")
+})
+
+test("AGENT_MEMORY_TRIAGE=heuristic + AGENT_MEMORY_EXTRACT_RUNS=1 + AGENT_MEMORY_JUDGES=0 pin legacy single-pass behavior end to end via the CLI", async () => {
+  const { dir, env, out, deps } = setup()
+  mkdirSync(join(dir, "transcripts", "proja"), { recursive: true })
+  writeFileSync(join(dir, "transcripts", "proja", "ses_1.md"), transcript)
+  let calls = 0
+  const singlePassLlm: LlmClient = {
+    describe: () => "fake",
+    complete: async () => {
+      calls++
+      return JSON.stringify([{ type: "know_how", title: "Tip", trigger: "when", lesson: "Do it.", domain: ["d"], evidence: [{ message_id: "msg_u1" }], salience: 8, volatile: false }])
+    },
+  }
+  const legacyEnv = { ...env, AGENT_MEMORY_TRIAGE: "heuristic", AGENT_MEMORY_EXTRACT_RUNS: "1", AGENT_MEMORY_JUDGES: "0" }
+  expect(await runCli(["run"], legacyEnv, { ...deps, llm: singlePassLlm })).toBe(0)
+  expect(out.join("\n")).toContain("1 added")
+  expect(calls).toBe(1) // heuristic triage + single extract run + no judges -> exactly one LLM call
+})
+
 test("review skips corrupt entry files instead of hiding or failing", async () => {
   const { dir, env, out, err, deps } = setup()
   mkdirSync(join(dir, "transcripts", "proja"), { recursive: true })

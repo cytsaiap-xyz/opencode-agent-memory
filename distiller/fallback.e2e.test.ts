@@ -73,7 +73,14 @@ const WARN_PREFIX = "agent-memory: sqlite unavailable"
 
 test("(a) fallback pipeline run: FakeLlm run in a scratch HOME writes memories, ledger.jsonl, is idempotent, renders INDEX.md", async () => {
   const dir = mkdtempSync(join(tmpdir(), "amem-fb-pipe-"))
-  const env = { AGENT_MEMORY_HOME: dir, AGENT_MEMORY_IDLE_HOURS: "0", ...NO_SQLITE_ENV }
+  // Legacy pinning: scriptedLlm below returns exactly one reply then falls back to "[]" —
+  // pin the pre-quality-pack triage/extractRuns/judges semantics so it isn't desynced by
+  // the new defaults (llm triage, extractRuns=2, judges=3), which issue more LLM calls.
+  const env = {
+    AGENT_MEMORY_HOME: dir, AGENT_MEMORY_IDLE_HOURS: "0",
+    AGENT_MEMORY_TRIAGE: "heuristic", AGENT_MEMORY_EXTRACT_RUNS: "1", AGENT_MEMORY_JUDGES: "0",
+    ...NO_SQLITE_ENV,
+  }
   mkdirSync(join(dir, "transcripts", "proja"), { recursive: true })
   writeFileSync(join(dir, "transcripts", "proja", "ses_1.md"), transcript("ses_1", "sha256:h1", "how to fix X"))
   const llm = scriptedLlm([candidateJson("Fix X", "Do Y because Z.")])

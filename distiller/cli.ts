@@ -36,6 +36,13 @@ const numEnv = (
   return n
 }
 
+const triageEnv = (env: Record<string, string | undefined>, key: string, fallback: "llm" | "heuristic"): "llm" | "heuristic" => {
+  const raw = env[key]
+  if (raw === undefined || raw === "") return fallback
+  if (raw !== "llm" && raw !== "heuristic") throw new Error(`${key} must be "llm" or "heuristic" (got "${raw}")`)
+  return raw
+}
+
 export async function runCli(
   argv: string[], env: Record<string, string | undefined>, deps: CliDeps = {},
 ): Promise<number> {
@@ -48,6 +55,9 @@ export async function runCli(
       case "run": {
         const idleHours = numEnv(env, "AGENT_MEMORY_IDLE_HOURS", 6, (n) => n >= 0)
         const salienceMin = numEnv(env, "AGENT_MEMORY_SALIENCE_MIN", 6, (n) => n >= 0 && n <= 10)
+        const triage = triageEnv(env, "AGENT_MEMORY_TRIAGE", "llm")
+        const extractRuns = numEnv(env, "AGENT_MEMORY_EXTRACT_RUNS", 2, (n) => Number.isInteger(n) && n >= 1 && n <= 5)
+        const judges = numEnv(env, "AGENT_MEMORY_JUDGES", 3, (n) => Number.isInteger(n) && n >= 0 && n <= 5)
         const pi = rest.indexOf("--project")
         const project = pi >= 0 ? rest[pi + 1] : undefined
         if (pi >= 0 && !project) throw new Error("--project needs a value")
@@ -55,7 +65,7 @@ export async function runCli(
         mkdirSync(cfg.storeDir, { recursive: true })
         const index = await openIndex(cfg, env, err)
         try {
-          const s = await runPipeline(cfg, { llm, index }, { project, idleHours, salienceMin })
+          const s = await runPipeline(cfg, { llm, index }, { project, idleHours, salienceMin, triage, extractRuns, judges })
           out(
             `distill done: ${s.ops.added} added, ${s.ops.updated} updated, ${s.ops.superseded} superseded, ` +
               `${s.ops.nooped} nooped, ${s.quarantined} quarantined, ${s.rejected} rejected, ${s.errors} errors ` +

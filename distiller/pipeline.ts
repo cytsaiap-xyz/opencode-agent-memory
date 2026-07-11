@@ -3,23 +3,34 @@ import { readdirSync } from "node:fs"
 import { join } from "node:path"
 import type { MemoryConfig } from "../shared/config"
 import { buildExtractPrompt, extractFromTranscript, type Candidate } from "./extract"
+import { judgeCandidate } from "./judge"
 import type { LlmClient } from "./llm"
 import type { MemoryQuery } from "./indexes"
+import { dedupPool, isDuplicate, mergeCandidates } from "./pool"
 import { writeQuarantineEntry } from "./quarantine"
 import { reconcileCandidate } from "./reconcile"
 import { computeConfidence, entryId, listEntryPaths, readEntry } from "./store"
+import { llmTriage } from "./triage"
 import { isEligible, scanSpool, type TranscriptMeta } from "./transcripts"
 import type { MemoryEntry } from "./types"
 
 export interface RunSummary {
   scanned: number; eligible: number; skippedProcessed: number; triagedOut: number
+  triagedLlm: number; triagedHeuristic: number; poolRaw: number
   candidates: number; rejected: number; quarantined: number
   ops: { added: number; updated: number; superseded: number; nooped: number }
   errors: number
 }
 
-export interface PipelineOptions { project?: string; now?: Date; idleHours?: number; salienceMin?: number }
+export interface PipelineOptions {
+  project?: string; now?: Date; idleHours?: number; salienceMin?: number
+  triage?: "llm" | "heuristic"; extractRuns?: number; judges?: number
+}
 
+// Degenerate transcripts (a greeting cannot hold durable knowledge) never reach triage,
+// LLM or heuristic — this floor is unconditional.
+const HARD_FLOOR_BODY = 80
+// Heuristic-mode-only gate (AGENT_MEMORY_TRIAGE=heuristic): the pre-quality-pack behavior.
 const TRIAGE_MIN_BODY = 400
 
 function quarantineEntry(c: Candidate, meta: TranscriptMeta, now: Date, extractor: string, promptHash: string): MemoryEntry {
@@ -37,6 +48,27 @@ function quarantineEntry(c: Candidate, meta: TranscriptMeta, now: Date, extracto
   }
 }
 
+// Union secrets across extraction runs, deduped by the same type+title/trigger rule as the
+// main pool, merging matches too — a secret candidate is still a Candidate, so it can
+// duplicate across runs exactly like a regular one.
+function dedupSecrets(
+  items: Array<{ item: Candidate; matches: string[] }>,
+): Array<{ item: Candidate; matches: string[] }> {
+  const result: Array<{ item: Candidate; matches: string[] }> = []
+  for (const sec of items) {
+    const idx = result.findIndex((r) => isDuplicate(sec.item, r.item))
+    if (idx === -1) {
+      result.push({ item: sec.item, matches: [...sec.matches] })
+    } else {
+      result[idx] = {
+        item: mergeCandidates(result[idx]!.item, sec.item),
+        matches: [...new Set([...result[idx]!.matches, ...sec.matches])],
+      }
+    }
+  }
+  return result
+}
+
 export async function runPipeline(
   cfg: MemoryConfig,
   deps: { llm: LlmClient; index: MemoryQuery },
@@ -45,9 +77,14 @@ export async function runPipeline(
   const now = opts.now ?? new Date()
   const idleHours = opts.idleHours ?? 6
   const salienceMin = opts.salienceMin ?? 6
-  const extractor = `distiller v0.1 / ${deps.llm.describe()}`
+  const triageMode = opts.triage ?? "llm"
+  const extractRuns = opts.extractRuns ?? 2
+  const judges = opts.judges ?? 3
+  let extractor = `distiller v0.1 / ${deps.llm.describe()}`
+  if (judges > 0) extractor += ` judges:${judges}`
   const summary: RunSummary = {
     scanned: 0, eligible: 0, skippedProcessed: 0, triagedOut: 0,
+    triagedLlm: 0, triagedHeuristic: 0, poolRaw: 0,
     candidates: 0, rejected: 0, quarantined: 0,
     ops: { added: 0, updated: 0, superseded: 0, nooped: 0 }, errors: 0,
   }
@@ -64,8 +101,14 @@ export async function runPipeline(
         summary.skippedProcessed++
         continue
       }
-      if (meta.body.length < TRIAGE_MIN_BODY) {
+
+      // promptHash is a pure hash of the fixed SYSTEM template (not the transcript), so
+      // this cheap call is independent of extractFromTranscript's actual LLM request.
+      const { promptHash } = buildExtractPrompt(meta)
+
+      if (meta.body.length < HARD_FLOOR_BODY) {
         summary.triagedOut++
+        summary.triagedHeuristic++
         deps.index.ledger.recordProcessed({
           session_id: meta.sessionId, content_hash: meta.contentHash,
           extractor_model: extractor, n_candidates: 0, n_committed: 0,
@@ -73,24 +116,96 @@ export async function runPipeline(
         continue
       }
 
-      // promptHash is a pure hash of the fixed SYSTEM template (not the transcript), so
-      // this cheap call is independent of extractFromTranscript's actual LLM request.
-      const { promptHash } = buildExtractPrompt(meta)
-      const validated = await extractFromTranscript(meta, deps.llm, salienceMin)
-      summary.candidates += validated.valid.length + validated.secrets.length
-      summary.rejected += validated.rejected.length
-      for (const rej of validated.rejected)
+      if (triageMode === "heuristic") {
+        if (meta.body.length < TRIAGE_MIN_BODY) {
+          summary.triagedOut++
+          summary.triagedHeuristic++
+          deps.index.ledger.recordProcessed({
+            session_id: meta.sessionId, content_hash: meta.contentHash,
+            extractor_model: extractor, n_candidates: 0, n_committed: 0,
+          })
+          continue
+        }
+      } else {
+        const verdict = await llmTriage(meta, deps.llm)
+        if (verdict.failedOpen) {
+          console.error(`distiller: ${meta.sessionId}: triage failed open: ${verdict.why}`)
+        } else if (!verdict.worth) {
+          summary.triagedOut++
+          summary.triagedLlm++
+          console.error(`distiller: ${meta.sessionId}: triaged out: ${verdict.why}`)
+          deps.index.ledger.recordProcessed({
+            session_id: meta.sessionId, content_hash: meta.contentHash,
+            extractor_model: extractor, n_candidates: 0, n_committed: 0,
+          })
+          continue
+        }
+      }
+
+      // EXTRACT x N: independent sequential runs. Each run is validated on its own so a
+      // single bad run's schema garbage can't poison the pool. A run that errors is logged
+      // and tolerated; the batch only fails (errors++, not ledgered — retried next run) if
+      // ALL runs error. Concatenated in run-index order — dedupPool is a greedy,
+      // order-dependent left-to-right merge, so the union must stay deterministic.
+      let allValid: Candidate[] = []
+      let allSecrets: Array<{ item: Candidate; matches: string[] }> = []
+      let allRejected: Array<{ item: unknown; reasons: string[] }> = []
+      let runErrors = 0
+      for (let i = 0; i < extractRuns; i++) {
+        try {
+          const validated = await extractFromTranscript(meta, deps.llm, salienceMin)
+          allValid = allValid.concat(validated.valid)
+          allSecrets = allSecrets.concat(validated.secrets)
+          allRejected = allRejected.concat(validated.rejected)
+        } catch (e) {
+          runErrors++
+          console.error(
+            `distiller: ${meta.sessionId}: extract run ${i + 1}/${extractRuns} failed: ${e instanceof Error ? e.message : String(e)}`,
+          )
+        }
+      }
+      if (runErrors === extractRuns) {
+        throw new Error(`all ${extractRuns} extraction runs failed`)
+      }
+
+      summary.rejected += allRejected.length
+      for (const rej of allRejected)
         console.error(`distiller: ${meta.sessionId}: rejected candidate: ${rej.reasons.join("; ")}`)
 
-      for (const sec of validated.secrets) {
+      summary.poolRaw += allValid.length + allSecrets.length
+
+      const pooled = dedupPool(allValid)
+      const secretPool = dedupSecrets(allSecrets)
+      summary.candidates += pooled.candidates.length + secretPool.length
+
+      for (const sec of secretPool) {
         const qe = quarantineEntry(sec.item, meta, now, extractor, promptHash)
         qe.notes.push(`${now.toISOString().slice(0, 10)}: quarantined — secret scan: ${sec.matches.join(", ")}`)
         await writeQuarantineEntry(cfg.storeDir, deps.index, qe)
         summary.quarantined++
       }
 
+      // JUDGE: after validation and pool dedup only (never spend judges on schema-invalid
+      // or duplicate candidates). Drop candidates whose consensus median falls below the
+      // salience floor — the same silent-drop semantics as the extractor's own self-score
+      // threshold in validateCandidates (below-threshold candidates are simply never
+      // counted, not rejected-with-reason).
+      let toReconcile = pooled.candidates
+      if (judges > 0) {
+        const kept: Candidate[] = []
+        for (const c of pooled.candidates) {
+          const verdict = await judgeCandidate(c, deps.llm, judges)
+          console.error(
+            `distiller: ${meta.sessionId}: judge: ${c.title} self:${verdict.selfScore} median:${verdict.salience} panel:${verdict.voted}/${verdict.panel}`,
+          )
+          if (verdict.salience < salienceMin) continue
+          kept.push({ ...c, salience: verdict.salience })
+        }
+        toReconcile = kept
+      }
+
       let committed = 0
-      for (const c of validated.valid) {
+      for (const c of toReconcile) {
         const r = await reconcileCandidate(c, meta, {
           llm: deps.llm, index: deps.index, storeDir: cfg.storeDir, now, extractorLabel: extractor, promptHash,
         })
@@ -103,7 +218,7 @@ export async function runPipeline(
 
       deps.index.ledger.recordProcessed({
         session_id: meta.sessionId, content_hash: meta.contentHash,
-        extractor_model: extractor, n_candidates: validated.valid.length + validated.secrets.length, n_committed: committed,
+        extractor_model: extractor, n_candidates: pooled.candidates.length + secretPool.length, n_committed: committed,
       })
     } catch (e) {
       summary.errors++
