@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { mkdir } from "node:fs/promises"
-import { readdirSync, statSync } from "node:fs"
+import { existsSync, readdirSync, statSync } from "node:fs"
 import { dirname, join } from "node:path"
 import type { EvidenceRef, MemoryClass, MemoryEntry, MemoryStatus, MemoryType, ReviewState } from "./types"
 
@@ -196,6 +196,28 @@ export function listEntryPaths(storeDir: string): string[] {
 
 export function quarantinePath(storeDir: string, id: string): string {
   return join(storeDir, "quarantine", `${id}.md`)
+}
+
+// Shared "-2/-3… suffix" uniquify convention for any path that writes a fresh entry under
+// a deterministic (project+title+day) id: appends a numeric suffix until BOTH the
+// filesystem (via pathFor) and the live index (via getById) agree the id is free, so a
+// same-project/title/day collision can never silently overwrite an existing file or
+// repoint an index row that isn't this same write. Returns e unchanged when e.id is
+// already free (the common case). Used by reconcile.ts's addEntry, quarantine.ts's
+// writeQuarantineEntry, and reflect.ts's insight write — one convention, one place.
+export function uniquifyEntryId<T extends MemoryEntry>(
+  e: T,
+  pathFor: (id: string) => string,
+  getById: (id: string) => unknown | null,
+): T {
+  if (!existsSync(pathFor(e.id)) && getById(e.id) === null) return e
+  let suffix = 2
+  let id = `${e.id}-${suffix}`
+  while (existsSync(pathFor(id)) || getById(id) !== null) {
+    suffix++
+    id = `${e.id}-${suffix}`
+  }
+  return { ...e, id }
 }
 
 export function computeConfidence(input: { sessions: number; humanApproved: boolean; contradicted: boolean }): number {

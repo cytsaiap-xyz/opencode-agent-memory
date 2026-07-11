@@ -5,7 +5,7 @@ import { stripFences } from "./extract"
 import type { LlmClient } from "./llm"
 import type { MemoryQuery } from "./indexes"
 import { writeQuarantineEntry } from "./quarantine"
-import { computeConfidence, entryId, parseEntry, writeEntry } from "./store"
+import { computeConfidence, entryId, entryPath, parseEntry, uniquifyEntryId, writeEntry } from "./store"
 import type { TranscriptMeta } from "./transcripts"
 import type { MemoryEntry } from "./types"
 
@@ -148,13 +148,11 @@ async function addEntry(
     const updated = await applyUpdate(entry.id, "re-extracted", c, meta, deps)
     return { op: "UPDATE", entry: updated! }
   }
-  let suffix = 2
-  let id = `${entry.id}-${suffix}`
-  while (deps.index.getById(id)) {
-    suffix++
-    id = `${entry.id}-${suffix}`
-  }
-  const uniquified: MemoryEntry = { ...entry, id }
+  const uniquified = uniquifyEntryId(
+    entry,
+    (id) => entryPath(deps.storeDir, { ...entry, id }),
+    (id) => deps.index.getById(id),
+  )
   const path = await writeEntry(deps.storeDir, uniquified)
   deps.index.upsertEntry(uniquified, path)
   return { op: "ADD", entry: uniquified }
@@ -209,42 +207,58 @@ async function interceptPending(
   return { op: "SUPERSEDE_PENDING", entry }
 }
 
+// Always creates (or reuses) a pending SUPERSEDE_PENDING proposal for "target absorbed by
+// byId", regardless of target's own type — the caller decides WHY this needs to go through
+// review (target itself being policy-typed, or — distiller/reflect.ts's policy-KEEP merge
+// case — the entry it would be merged INTO being policy-typed even though target is a plain
+// pitfall/know_how). byId is looked up fresh via the index and cloned as the quarantined
+// proposal (supersedes: target.id), routed through writeQuarantineEntry (which uniquifies
+// the id, since byId's own row is still occupying that id), deduped against an
+// already-pending proposal via findExistingPending. target itself is left completely
+// untouched — the mutation lives entirely in the new quarantine file, pending human
+// approval.
+export async function proposeSupersessionPending(
+  target: MemoryEntry,
+  byId: string,
+  reason: string,
+  deps: { storeDir: string; index: MemoryQuery; now: Date },
+): Promise<{ op: "SUPERSEDE_PENDING"; entry: MemoryEntry }> {
+  const dateStr = deps.now.toISOString().slice(0, 10)
+  const existing = findExistingPending(deps.storeDir, target.id)
+  if (existing) return { op: "SUPERSEDE_PENDING", entry: existing }
+  const byHit = deps.index.getById(byId)
+  const base = byHit ? byHit.entry : target
+  const pending: MemoryEntry = {
+    ...base,
+    status: "quarantined",
+    review: "human_pending",
+    supersedes: target.id,
+    updated_at: deps.now.toISOString(),
+    notes: [...base.notes, `${dateStr}: pending review — proposes to merge ${target.id} into ${byId}: ${reason}`],
+  }
+  const entry = await writeQuarantineEntry(deps.storeDir, deps.index, pending)
+  return { op: "SUPERSEDE_PENDING", entry }
+}
+
 // Shared "supersede target -> byId" mechanics, factored out so distiller/reflect.ts's MERGE
 // op (absorb -> keep, where keep already exists) can ride the exact same policy governance
 // as reconcile's SUPERSEDE (candidate -> new entry). Given only a target entry and the *id*
 // of whatever now supersedes it, applies the same two-way split the inline SUPERSEDE code
 // below used to do: decision/convention targets are deliberate human calls, so instead of
-// auto-mutating them, the entry that supersedes them (byId, looked up fresh via the index) is
-// cloned as a quarantined proposal — supersedes: target.id, routed through the existing
-// review queue via writeQuarantineEntry (which uniquifies the id, since byId's own row is
-// still occupying that id) — exactly like reconcile's interceptPending does for its candidate
-// case, and dedupes against an already-pending proposal via findExistingPending. Anything
-// else is tombstoned in place, pointing at byId — reconcile's non-policy SUPERSEDE branch
-// only ever reaches this half (the policy branch is intercepted upstream, before a byId even
-// exists), so its output stays byte-identical to before this extraction.
+// auto-mutating them, route through proposeSupersessionPending. Anything else is tombstoned
+// in place, pointing at byId — reconcile's non-policy SUPERSEDE branch only ever reaches
+// this half (the policy branch is intercepted upstream, before a byId even exists), so its
+// output stays byte-identical to before this extraction.
 export async function applySupersession(
   target: MemoryEntry,
   byId: string,
   reason: string,
   deps: { storeDir: string; index: MemoryQuery; now: Date },
 ): Promise<{ op: "SUPERSEDE" | "SUPERSEDE_PENDING"; entry: MemoryEntry }> {
-  const dateStr = deps.now.toISOString().slice(0, 10)
   if (target.type === "decision" || target.type === "convention") {
-    const existing = findExistingPending(deps.storeDir, target.id)
-    if (existing) return { op: "SUPERSEDE_PENDING", entry: existing }
-    const byHit = deps.index.getById(byId)
-    const base = byHit ? byHit.entry : target
-    const pending: MemoryEntry = {
-      ...base,
-      status: "quarantined",
-      review: "human_pending",
-      supersedes: target.id,
-      updated_at: deps.now.toISOString(),
-      notes: [...base.notes, `${dateStr}: pending review — proposes to merge ${target.id} into ${byId}: ${reason}`],
-    }
-    const entry = await writeQuarantineEntry(deps.storeDir, deps.index, pending)
-    return { op: "SUPERSEDE_PENDING", entry }
+    return await proposeSupersessionPending(target, byId, reason, deps)
   }
+  const dateStr = deps.now.toISOString().slice(0, 10)
   const updated: MemoryEntry = {
     ...target,
     status: "superseded",

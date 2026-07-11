@@ -9,8 +9,8 @@ import type { MemoryQuery } from "./indexes"
 import { judgeCandidate } from "./judge"
 import type { LlmClient } from "./llm"
 import { writeQuarantineEntry } from "./quarantine"
-import { applySupersession } from "./reconcile"
-import { computeConfidence, entryId, listEntryPaths, readEntry, writeEntry } from "./store"
+import { applySupersession, findExistingPending, proposeSupersessionPending } from "./reconcile"
+import { computeConfidence, entryId, entryPath, listEntryPaths, readEntry, uniquifyEntryId, writeEntry } from "./store"
 import { scanSpool } from "./transcripts"
 import type { EvidenceRef, MemoryEntry, MemoryStatus, MemoryType } from "./types"
 
@@ -292,8 +292,18 @@ export async function runReflect(cfg: MemoryConfig, deps: ReflectDeps, opts?: { 
         if (deps.dryRun) {
           deps.log(`[dry-run] insight: would create "${entry.title}" (${entry.type}) citing ${memberIds.join(",")}`)
         } else {
-          const path = await writeEntry(deps.storeDir, entry)
-          deps.index.upsertEntry(entry, path)
+          // entryId is deterministic on project+title+day: a same-project/title/day
+          // collision with an existing (possibly unrelated) entry must never silently
+          // overwrite that entry's file or repoint its index row — uniquify against
+          // both the filesystem and the index first, mirroring reconcile.ts's addEntry
+          // / quarantine.ts's writeQuarantineEntry convention.
+          const finalEntry = uniquifyEntryId(
+            entry,
+            (id) => entryPath(deps.storeDir, { ...entry, id }),
+            (id) => deps.index.getById(id),
+          )
+          const path = await writeEntry(deps.storeDir, finalEntry)
+          deps.index.upsertEntry(finalEntry, path)
         }
         summary.insights++
         continue
@@ -310,17 +320,43 @@ export async function runReflect(cfg: MemoryConfig, deps: ReflectDeps, opts?: { 
         continue
       }
 
+      // Idempotency: a policy-routed absorb stays "active" (nothing is applied until a
+      // human approves the pending proposal), so alreadyGone above can't catch a rerun of
+      // the SAME cluster — the cluster still reforms every run. If EVERY absorb member
+      // already has a pending proposal targeting it specifically (findExistingPending
+      // only ever matches status "quarantined" + review "human_pending", i.e. inherently
+      // non-archived), this merge was already proposed and nothing has changed since:
+      // count the rerun as skipped instead of re-incrementing mergesPending or touching
+      // the store again.
+      const allAbsorbsAlreadyPending = op.absorb.every((id) => findExistingPending(deps.storeDir, id) !== null)
+      if (allAbsorbsAlreadyPending) {
+        summary.skipped++
+        deps.log(`reflect: cluster [${memberIds.join(",")}] merge already pending review — skipping`)
+        continue
+      }
+
+      // decision/convention KEEP entries are deliberate human calls — same governance
+      // reconcile.ts already applies to its own UPDATE/SUPERSEDE targets. Absorbing
+      // evidence into a policy KEEP via a raw writeEntry would be an ungated mutation of
+      // that policy (and could silently fold a CONTRADICTING session in as corroborating
+      // evidence), so once the keep side is policy-typed, EVERY absorb in this merge — not
+      // just ones that are themselves policy-typed — is forced through pending review
+      // instead of being applied directly. Policy entries only change through
+      // human-approved ops.
+      const keepIsPolicy = keepItem.entry.type === "decision" || keepItem.entry.type === "convention"
+
       const dateStr = deps.now.toISOString().slice(0, 10)
       const directlyAbsorbed: MemoryEntry[] = []
 
       for (const absorbId of op.absorb) {
         const target = cluster.members.find((m) => m.entry.id === absorbId)!.entry
-        const isPolicy = target.type === "decision" || target.type === "convention"
+        const isPolicy = keepIsPolicy || target.type === "decision" || target.type === "convention"
 
         if (isPolicy) {
           summary.mergesPending++
-          if (deps.dryRun) deps.log(`[dry-run] merge: ${target.id} -> pending review (policy type), absorbed by ${op.keep}`)
-          else await applySupersession(target, keepItem.entry.id, op.reason, { storeDir: deps.storeDir, index: deps.index, now: deps.now })
+          const why = keepIsPolicy ? `keep ${op.keep} is policy-type (${keepItem.entry.type})` : `${target.id} is policy-type (${target.type})`
+          if (deps.dryRun) deps.log(`[dry-run] merge: ${target.id} -> pending review (${why}), absorbed by ${op.keep}`)
+          else await proposeSupersessionPending(target, keepItem.entry.id, op.reason, { storeDir: deps.storeDir, index: deps.index, now: deps.now })
         } else {
           summary.merges++
           statusOverride.set(target.id, "superseded")
@@ -330,7 +366,11 @@ export async function runReflect(cfg: MemoryConfig, deps: ReflectDeps, opts?: { 
         }
       }
 
-      if (directlyAbsorbed.length > 0) {
+      if (keepIsPolicy) {
+        deps.log(
+          `reflect: merge keep ${op.keep} is policy-type (${keepItem.entry.type}) — evidence absorption from ${op.absorb.join(",")} withheld pending review`,
+        )
+      } else if (directlyAbsorbed.length > 0) {
         if (deps.dryRun) {
           deps.log(`[dry-run] merge: keep ${op.keep} gains evidence from ${directlyAbsorbed.map((e) => e.id).join(",")}`)
         } else {

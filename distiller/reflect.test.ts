@@ -8,7 +8,7 @@ import { openMemoryIndex } from "./indexes"
 import type { MemoryQuery } from "./indexes"
 import type { LlmClient } from "./llm"
 import { buildReflectPrompt, parseReflectOp, REFLECT_SCHEMA, runReflect, type ReflectDeps } from "./reflect"
-import { readEntry, writeEntry } from "./store"
+import { entryId, entryPath, readEntry, writeEntry } from "./store"
 import type { MemoryEntry } from "./types"
 
 const tmp = () => mkdtempSync(join(tmpdir(), "amem-reflect-"))
@@ -272,6 +272,45 @@ test("insight: judge gate above threshold passes and records the judge note", as
   expect(insightEntry.notes.some((n) => n.includes("judged: median 8"))).toBe(true)
 })
 
+test("insight: an id collision with a pre-existing unrelated entry never overwrites it (uniquifies to -2)", async () => {
+  const { storeDir, index, cfg } = setup()
+  const a = entry("mem_20260710_ins1a1", { title: "race condition in queue drain alpha", trigger: "queue drain race", domain: ["queue2"] })
+  const b = entry("mem_20260710_ins1b1", { title: "race condition in queue drain beta", trigger: "queue drain race", domain: ["queue2"] })
+  await seedActive(storeDir, index, a)
+  await seedActive(storeDir, index, b)
+
+  const insightTitle = "Queue drain race insight"
+  // entryId is deterministic on project+title+day — precompute the exact id the insight
+  // write will land on, and pre-seed a completely unrelated active entry there first, so
+  // the write path is forced to collide.
+  const victimId = entryId("proja", insightTitle, NOW)
+  const victim = entry(victimId, {
+    project: "proja", title: "unrelated pre-existing victim entry", trigger: "unrelated trigger",
+    domain: ["other"], lesson: "victim lesson body must survive untouched.",
+  })
+  await seedActive(storeDir, index, victim)
+  const victimPath = entryPath(storeDir, victim)
+  const victimBefore = await readEntry(victimPath)
+
+  const insightReply = JSON.stringify({
+    op: "insight", type: "know_how", title: insightTitle,
+    trigger: "queue drain race", lesson: "Serialize queue drain operations to avoid the race.",
+    domain: ["queue2"], cites: [a.id, b.id],
+  })
+  const summary = await runReflect(cfg, baseDeps({ index, storeDir, llm: fakeLlm(insightReply) }))
+  expect(summary.insights).toBe(1)
+
+  // The victim file is byte-for-byte unchanged — no silent overwrite.
+  const victimAfter = await readEntry(victimPath)
+  expect(victimAfter).toEqual(victimBefore)
+
+  // The insight itself landed at the uniquified -2 id instead.
+  const insightHit = index.getById(`${victimId}-2`)
+  expect(insightHit).not.toBeNull()
+  expect(insightHit!.entry.title).toBe(insightTitle)
+  expect(insightHit!.entry.id).toBe(`${victimId}-2`)
+})
+
 // ---------------------------------------------------------------------------
 // merge
 // ---------------------------------------------------------------------------
@@ -331,6 +370,75 @@ test("merge: absorbing a policy-type (decision/convention) member routes to quar
   expect(qEntry.status).toBe("quarantined")
   expect(qEntry.review).toBe("human_pending")
   expect(qEntry.supersedes).toBe(absorb.id)
+})
+
+test("merge: policy-type KEEP is never mutated by absorption even when the absorb member itself is non-policy — whole merge routes to pending review", async () => {
+  const { storeDir, index, cfg } = setup()
+  const keep = entry("mem_20260710_pol1ke", {
+    type: "convention", title: "naming prefix rule module names variant", trigger: "new module created", domain: ["style4"],
+  })
+  const absorb = entry("mem_20260710_pol1ab", {
+    type: "pitfall", title: "naming prefix rule for modules variant", trigger: "new module created", domain: ["style4"],
+  })
+  await seedActive(storeDir, index, keep)
+  await seedActive(storeDir, index, absorb)
+  const keepPath = entryPath(storeDir, keep)
+  const keepBefore = await readEntry(keepPath)
+
+  const mergeReply = JSON.stringify({ op: "merge", keep: keep.id, absorb: [absorb.id], reason: "same lesson, different wording" })
+  const summary = await runReflect(cfg, baseDeps({ index, storeDir, llm: fakeLlm(mergeReply) }))
+
+  expect(summary.clusters).toBe(1)
+  expect(summary.merges).toBe(0)
+  expect(summary.mergesPending).toBe(1)
+
+  // Governance bypass regression: the keep entry (policy-typed) must be byte-unchanged —
+  // no evidence merged in, no note appended — even though the absorbed member is a plain
+  // pitfall, not itself policy-typed.
+  const keepAfter = await readEntry(keepPath)
+  expect(keepAfter).toEqual(keepBefore)
+
+  // The absorbed member is untouched too — nothing is applied until a human approves.
+  const absorbHit = index.getById(absorb.id)!
+  expect(absorbHit.entry.status).toBe("active")
+
+  const qFiles = mdFilesUnder(join(storeDir, "quarantine"))
+  expect(qFiles.length).toBe(1)
+  const qEntry = await readEntry(join(storeDir, "quarantine", qFiles[0]!))
+  expect(qEntry.status).toBe("quarantined")
+  expect(qEntry.review).toBe("human_pending")
+  expect(qEntry.supersedes).toBe(absorb.id)
+})
+
+test("merge: rerunning after a policy merge counts as skipped (not a new mergesPending) with no new quarantine writes", async () => {
+  const { storeDir, index, cfg } = setup()
+  const keep = entry("mem_20260710_idem1k", {
+    type: "convention", title: "commit message format convention rule alpha", trigger: "new commit created", domain: ["style5"],
+  })
+  const absorb = entry("mem_20260710_idem1a", {
+    type: "convention", title: "commit message format convention rule beta", trigger: "new commit created", domain: ["style5"],
+  })
+  await seedActive(storeDir, index, keep)
+  await seedActive(storeDir, index, absorb)
+
+  const mergeReply = JSON.stringify({ op: "merge", keep: keep.id, absorb: [absorb.id], reason: "dup" })
+  let calls = 0
+  const countingLlm: LlmClient = { describe: () => "fake", complete: async () => { calls++; return mergeReply } }
+
+  const first = await runReflect(cfg, baseDeps({ index, storeDir, llm: countingLlm }))
+  expect(first.mergesPending).toBe(1)
+  expect(calls).toBe(1)
+  const qFilesAfterFirst = mdFilesUnder(join(storeDir, "quarantine"))
+  expect(qFilesAfterFirst.length).toBe(1)
+
+  const second = await runReflect(cfg, baseDeps({ index, storeDir, llm: countingLlm }))
+  expect(second.mergesPending).toBe(0)
+  expect(second.merges).toBe(0)
+  expect(second.skipped).toBe(1)
+  expect(calls).toBe(2) // the cluster LLM is still invoked; only the apply-side write is skipped
+
+  const qFilesAfterSecond = mdFilesUnder(join(storeDir, "quarantine"))
+  expect(qFilesAfterSecond.length).toBe(1) // no second quarantine file written
 })
 
 test("merge: an absorb member already superseded earlier in the same run (multi-domain overlap) is skipped on the later cluster", async () => {
@@ -509,6 +617,62 @@ test("dry-run: writes nothing to disk (md file set + mtimes unchanged) while sti
   expect(summary.insights).toBe(1)
   expect(summary.promotions).toBe(1)
   expect(after).toEqual(before)
+})
+
+test("dry-run: merge (both non-policy and policy-KEEP branches) makes zero file/index changes while still reporting planned ops", async () => {
+  const { storeDir, index, cfg } = setup()
+  // Non-policy pair: both pitfalls, direct-absorb branch.
+  const keepA = entry("mem_20260710_dr1kp", { type: "pitfall", title: "retry backoff jitter missing bug alpha", trigger: "retry burst", domain: ["dry1"] })
+  const absorbA = entry("mem_20260710_dr1ab", { type: "pitfall", title: "retry backoff jitter missing bug beta", trigger: "retry burst", domain: ["dry1"] })
+  // Policy-KEEP pair: convention keep, pitfall absorb — the Finding-1 governance path.
+  const keepB = entry("mem_20260710_dr2kp", { type: "convention", title: "log level naming convention rule alpha", trigger: "new log statement", domain: ["dry2"] })
+  const absorbB = entry("mem_20260710_dr2ab", { type: "pitfall", title: "log level naming convention rule beta", trigger: "new log statement", domain: ["dry2"] })
+  await seedActive(storeDir, index, keepA)
+  await seedActive(storeDir, index, absorbA)
+  await seedActive(storeDir, index, keepB)
+  await seedActive(storeDir, index, absorbB)
+
+  const replyA = JSON.stringify({ op: "merge", keep: keepA.id, absorb: [absorbA.id], reason: "dup" })
+  const replyB = JSON.stringify({ op: "merge", keep: keepB.id, absorb: [absorbB.id], reason: "dup" })
+  const llm: LlmClient = {
+    describe: () => "fake",
+    complete: async (req) => (req.prompt.includes(keepA.id) ? replyA : replyB),
+  }
+
+  const snapshot = () => {
+    const files: Array<{ path: string; mtime: number }> = []
+    const walk = (dir: string) => {
+      let names: string[] = []
+      try {
+        names = readdirSync(dir)
+      } catch {
+        return
+      }
+      for (const n of names) {
+        const p = join(dir, n)
+        if (statSync(p).isDirectory()) walk(p)
+        else if (p.endsWith(".md")) files.push({ path: p, mtime: statSync(p).mtimeMs })
+      }
+    }
+    walk(storeDir)
+    return files.sort((x, y) => x.path.localeCompare(y.path))
+  }
+
+  const before = snapshot()
+  const summary = await runReflect(cfg, baseDeps({ index, storeDir, llm, dryRun: true }))
+  const after = snapshot()
+
+  expect(summary.clusters).toBe(2)
+  expect(summary.merges).toBe(1)
+  expect(summary.mergesPending).toBe(1)
+  expect(after).toEqual(before) // no file created/modified, including no quarantine file
+
+  const keepAHit = index.getById(keepA.id)!
+  expect(keepAHit.entry.evidence.length).toBe(1) // no evidence merged in during dry-run
+  const absorbAHit = index.getById(absorbA.id)!
+  expect(absorbAHit.entry.status).toBe("active") // no tombstone during dry-run
+  const keepBHit = index.getById(keepB.id)!
+  expect(keepBHit.entry.notes.length).toBe(0) // policy keep untouched during dry-run too
 })
 
 // ---------------------------------------------------------------------------
