@@ -96,3 +96,33 @@ test("filescan index: search/getById/stats/recordAccess/accessStats/ledger/rebui
   expect(await idx.rebuildFrom(dir)).toBe(0) // no-op in filescan mode: returns current entry count, writes nothing
   expect(() => idx.close()).not.toThrow()
 })
+
+// Hardening regression: distiller/indexes.ts must not statically value-import ledger.ts
+// (whose line 1 is `import { Database } from "bun:sqlite"`), so that a missing/broken
+// bun:sqlite native binding can't crash the process before probeSqlite ever runs — the
+// lazy require() inside SqliteIndex's constructor (only reached when probe.ok) is what
+// makes this possible. We can't simulate an actually-missing bun:sqlite binding from a
+// normal test run (it's genuinely present here); that end-to-end proof is VERIFY item 6,
+// exercised only in the corporate/no-native-binding environment the spec targets. What we
+// *can* prove in-process: the module loads and openMemoryIndex still returns a working
+// filescan index — without ever touching sqlite — when probe.ok is false, spawned as a
+// fresh subprocess so this test can't be fooled by sqlite already being loaded elsewhere
+// in the same process.
+test("module loads and openMemoryIndex(..., {ok: false}, ...) returns filescan without touching sqlite (subprocess)", async () => {
+  const dir = tmp()
+  const proc = Bun.spawn({
+    cmd: [
+      "bun",
+      "-e",
+      `const { openMemoryIndex } = await import("${join(import.meta.dir, "indexes.ts")}");
+       const idx = openMemoryIndex(process.argv[1], { ok: false, reason: "t" }, { warn: () => {} });
+       console.log(idx.mode);`,
+      dir,
+    ],
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited])
+  expect(exitCode).toBe(0)
+  expect(stdout.trim()).toBe("filescan")
+})

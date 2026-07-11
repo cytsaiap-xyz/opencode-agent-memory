@@ -69,6 +69,10 @@ Not identical ranking to bm25 — documented as such. At wiki scale (≤ low
 thousands of entries) an O(n) parse-and-scan per query is measured-fine
 (store parse throughput is already >1k entries/sec in the eval harness).
 
+In filescan mode, differing neighbor top-5 membership (substring scoring vs
+bm25) may occasionally yield a duplicate ADD instead of an UPDATE; this is
+bounded by the same reconcile-dedupe guarantee that covers mode switching.
+
 ## 5. File ledger (`ledger.jsonl`)
 
 - One JSON line per processed session: `{ session_id, content_hash,

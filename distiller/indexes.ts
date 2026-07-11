@@ -1,7 +1,11 @@
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs"
 import { basename, dirname, join } from "node:path"
-import { MemoryIndex } from "./ledger"
-import type { SearchHit } from "./ledger"
+// Type-only: erased at compile time, so this does NOT pull bun:sqlite (ledger.ts's
+// line 1) into any entry point's module graph. The value import lives inside
+// SqliteIndex's constructor via require() instead — see below — so a missing/broken
+// bun:sqlite binding only throws when we actually try to use sqlite (inside
+// openMemoryIndex's probe.ok branch, which can catch it), never at module load.
+import type { MemoryIndex, SearchHit } from "./ledger"
 import type { SqliteProbe } from "../shared/sqliteProbe"
 import { listEntryPaths, parseEntry } from "./store"
 import type { MemoryEntry } from "./types"
@@ -74,6 +78,13 @@ export class SqliteIndex implements MemoryQuery {
   readonly ftsRebuildNeeded: boolean
 
   constructor(dbPath: string) {
+    // Lazy, synchronous require (not a static import) so bun:sqlite is only touched
+    // here, at actual construction time — never at module load. openMemoryIndex's
+    // probe.ok branch wraps `new SqliteIndex(...)` in try/catch, so if the native
+    // binding is missing/broken despite probeSqlite having passed (or the probe was
+    // skipped), the throw from require() or from `new MemoryIndex(...)` below is
+    // caught there and degrades to FileScanIndex instead of crashing the process.
+    const { MemoryIndex } = require("./ledger") as typeof import("./ledger")
     this.inner = new MemoryIndex(dbPath)
     this.ftsRebuildNeeded = this.inner.ftsRebuildNeeded
     const inner = this.inner
@@ -400,24 +411,36 @@ export class FileScanIndex implements MemoryQuery {
   }
 }
 
+const sqliteUnavailableWarning = (reason: string): string =>
+  `agent-memory: sqlite unavailable (${reason}) — markdown-scan mode: search is O(n) without bm25 ranking, access stats disabled, ledger uses ledger.jsonl`
+
 export function openMemoryIndex(
   storeDir: string,
   probe: SqliteProbe,
   opts?: { dbPath?: string; warn?: (line: string) => void },
 ): MemoryQuery {
-  if (probe.ok) {
-    mkdirSync(storeDir, { recursive: true })
-    const dbPath = opts?.dbPath ?? join(storeDir, "index.db")
-    mkdirSync(dirname(dbPath), { recursive: true })
-    return new SqliteIndex(dbPath)
-  }
-
   // Dedup ("once per process per entry point") is the entry point's responsibility —
   // an entry point calls this factory once per process. Here we simply emit exactly
   // one warn call per factory invocation.
   const warn = opts?.warn ?? console.error
-  warn(
-    `agent-memory: sqlite unavailable (${probe.reason}) — markdown-scan mode: search is O(n) without bm25 ranking, access stats disabled, ledger uses ledger.jsonl`,
-  )
+
+  if (probe.ok) {
+    mkdirSync(storeDir, { recursive: true })
+    const dbPath = opts?.dbPath ?? join(storeDir, "index.db")
+    mkdirSync(dirname(dbPath), { recursive: true })
+    try {
+      return new SqliteIndex(dbPath)
+    } catch (e) {
+      // Defense in depth: probeSqlite already verified sqlite works before we got
+      // here, but if require("./ledger") or `new MemoryIndex(...)` still throws
+      // (native binding vanished between probe and use, a build stripped bun:sqlite,
+      // etc. — the corporate no-native-binding scenario this design targets), degrade
+      // to filescan instead of letting the entry point crash.
+      warn(sqliteUnavailableWarning(String(e)))
+      return new FileScanIndex(storeDir, warn)
+    }
+  }
+
+  warn(sqliteUnavailableWarning(String(probe.reason)))
   return new FileScanIndex(storeDir, warn)
 }
