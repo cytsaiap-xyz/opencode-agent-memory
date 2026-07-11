@@ -504,6 +504,83 @@ query into tokens and picks a strategy per query:
   mild recall improvement (bm25 ranking still applies on top), not a
   regression; existing English search tests are the regression net for it.
 
+## SQLite-optional mode
+
+`index.db` is an optional accelerator, not a dependency. On startup, every
+entry point (`distiller/cli.ts`, `mcp-server/main.ts`, `mcp-server/probe.ts`,
+`eval/`) runs a one-time probe (`shared/sqliteProbe.ts`): open a throwaway
+`bun:sqlite` database under `<storeDir>/.sqlite-probe.tmp`, set
+`PRAGMA journal_mode = WAL`, create a table, insert, read back, close, and
+unlink the probe files. If that roundtrip succeeds, everything runs exactly
+as documented above — sqlite mode is byte-identical to how this system has
+always behaved, nothing to configure. If it throws for any reason (no
+`bun:sqlite` native bindings, a restricted/read-only mount, filesystem
+locking not supported, etc.), the system transparently falls back to scanning
+the markdown store directly. **The markdown files under `store/memories/` and
+`store/quarantine/` are always the source of truth; `index.db` is always a
+derived, disposable projection of them** — this is true in both modes, which
+is exactly what makes the fallback safe.
+
+Force fallback mode deliberately (e.g. to test it, or because sqlite passes
+the probe but is known to be unreliable in your environment) with:
+
+```bash
+AGENT_MEMORY_NO_SQLITE=1 bun run distill run
+AGENT_MEMORY_NO_SQLITE=1 bun run mcp
+AGENT_MEMORY_NO_SQLITE=1 bun run mcp:probe "<query>"
+```
+
+When the probe fails (or `AGENT_MEMORY_NO_SQLITE=1` is set), exactly one
+warning is printed to **stderr** per process, never stdout (the mcp-server's
+stdout is the MCP protocol channel):
+
+```
+agent-memory: sqlite unavailable (<reason>) — markdown-scan mode: search is
+O(n) without bm25 ranking, access stats disabled, ledger uses ledger.jsonl
+```
+
+### What degrades and what's genuinely lost
+
+| Capability | sqlite mode | fallback (filescan) mode | What's actually lost |
+|---|---|---|---|
+| `search_memory` ranking | FTS5 bm25 + trigram tokenizer | deterministic keyword scoring: `hits = Σ per token (title×3 + trigger×2 + lesson×1 + domain×2)` case-insensitive substring counts, `score = -hits`, zero-hit entries excluded | Not bm25 — a cruder but fully deterministic and documented substring scorer. At wiki scale (≤ low thousands of entries) this is a full markdown parse-and-scan per query, measured-fine. |
+| CJK search (e.g. `"時序"`) | trigram FTS (3+ char runs) / LIKE fallback (2-char) | native substring match, no tokenizer needed, works for any length | Nothing — filescan CJK search is arguably simpler/more predictable than the trigram/LIKE split. |
+| `get_memory` / `getById` | indexed lookup | filename scan (`<id>.md` across `memories/` + `quarantine/`) | Nothing functionally — O(n) instead of O(1), invisible at wiki scale. |
+| `memory_stats` / `distill stats` | table aggregate | markdown scan, counts `byStatus`/`byType` | Nothing — same numbers either way (see VERIFY item 3). |
+| Access stats (`recordAccess`, the ranking recency/reinforcement signal) | tracked (`access_count`, `last_accessed`) | **switched off** — `recordAccess` is a no-op, `accessStats` returns `null`, `memory_stats`/`search_memory` report `accessAvailable: false` | **Genuinely lost.** There is no filesystem-native way to track per-entry access counts without reintroducing a database, so this signal simply disappears in fallback mode. Ranking still applies the confidence/recency boost — it just loses the "which entries actually get queried" reinforcement input. |
+| Idempotency ledger (`processed_sessions`) | sqlite table | **`store/ledger.jsonl`** append-only file (see below) | Nothing — same correctness guarantee, different storage. |
+| `distill reindex` | rebuilds `index.db` from markdown | no-op: prints `markdown is the store — nothing to rebuild (filescan mode)`, exit 0 | Nothing to lose — there's no derived index to rebuild when markdown is read directly. |
+
+### `ledger.jsonl`
+
+Idempotency (never re-extracting the same transcript twice) matters for
+correctness, not just token cost — a nightly run without it would re-process
+every transcript in history every night, multiplying wall-clock time and
+churning already-committed memories with spurious "re-extracted" update
+noise. In fallback mode this ledger lives at `<storeDir>/ledger.jsonl`: one
+JSON line per processed session (`session_id`, `content_hash`,
+`pipeline_version`, `extractor_model`, `processed_at`, `n_candidates`,
+`n_committed` — the same fields as the sqlite table), written by a single
+writer (the distiller), append-only. A crash mid-append at worst truncates
+the final line; the loader tolerates a torn final line silently (any other
+corrupt line logs one aggregate warning and is skipped). Sqlite mode and
+fallback mode never share or migrate ledger state — switching modes means,
+at worst, one extra re-extraction pass per transcript, and RECONCILE's own
+dedup logic absorbs the rest.
+
+### Corporate-deploy note
+
+There is nothing to configure for either mode. If `bun:sqlite` works in your
+environment, you automatically get the full accelerated path (bm25 ranking,
+access stats, O(1) lookups) with zero setup. If it doesn't — a restricted
+corporate mount, missing native bindings, whatever the cause — the system
+degrades to the markdown-scan fallback automatically, on its own, with a
+clear one-line warning explaining exactly what's off. Either way `setup.sh`,
+`distill run`, and the mcp-server work end-to-end; the only operational
+difference is that stderr will carry the warning line above once per process
+in fallback mode. See `docs/superpowers/VERIFY-sqlite-optional.md` for the
+verification record of this behavior against a real store.
+
 ## Regression eval
 
 `eval/` is a deterministic regression harness (`bun run eval`) that answers two
@@ -674,7 +751,10 @@ scripts/    install.sh
 
 See `docs/superpowers/specs/2026-07-10-agent-memory-design.md` for the full
 architecture, `docs/superpowers/specs/2026-07-11-regression-eval-design.md`
-for the eval harness design, `docs/superpowers/VERIFY.md` for the collector's
+for the eval harness design,
+`docs/superpowers/specs/2026-07-11-sqlite-optional-design.md` for the
+sqlite-optional design, `docs/superpowers/VERIFY.md` for the collector's
 manual verification checklist, `docs/superpowers/VERIFY-distiller.md` for the
-distiller's, `docs/superpowers/VERIFY-mcp.md` for the mcp-server's, and
-`docs/superpowers/VERIFY-eval.md` for the eval harness's.
+distiller's, `docs/superpowers/VERIFY-mcp.md` for the mcp-server's,
+`docs/superpowers/VERIFY-eval.md` for the eval harness's, and
+`docs/superpowers/VERIFY-sqlite-optional.md` for the sqlite-optional mode's.
