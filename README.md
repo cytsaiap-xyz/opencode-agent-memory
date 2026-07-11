@@ -170,34 +170,118 @@ run per-session — it's a scheduled batch job (see Scheduling below).
 Each eligible transcript (one session = one unit of work) goes through:
 
 ```
-INGEST → TRIAGE → EXTRACT → VALIDATE → RECONCILE → COMMIT → PUBLISH
+INGEST → TRIAGE(llm) → EXTRACT×N → VALIDATE → POOL-DEDUP → JUDGE → RECONCILE → COMMIT → PUBLISH
 ```
 
 1. **INGEST** — scan the transcript spool; skip a session if the ledger
    already has a row for its `(session_id, content_hash, pipeline_version)`,
    and skip any transcript that hasn't been idle for `AGENT_MEMORY_IDLE_HOURS`
    yet.
-2. **TRIAGE** — a cheap, LLM-free gate: transcripts whose body is under 400
-   characters are skipped (a ledger row with 0 candidates is still recorded,
-   so they aren't rescanned every run) without ever calling the LLM.
-3. **EXTRACT** — one big-model call per transcript, strict JSON array output
-   against a 6-type taxonomy (`decision`, `root_cause`, `pitfall`, `know_how`,
-   `convention`, `workflow`); candidates scoring below
-   `AGENT_MEMORY_SALIENCE_MIN` are silently dropped.
-4. **VALIDATE** (deterministic, no LLM) — per-field schema, every evidence
-   `message_id` must match a real `{#msg_id}` anchor in the transcript
-   (a hallucinated anchor rejects the candidate), `lesson` ≤ 80 words, and a
-   secret/high-entropy-token scan — a hit sends the candidate to quarantine
-   instead of rejecting it.
-5. **RECONCILE** (Mem0-style) — FTS-query the top 5 similar `active` memories,
+2. **TRIAGE** — a cheap pre-filter deciding whether the transcript plausibly
+   contains any durable knowledge at all, before spending a full extraction
+   call on it. A hard, LLM-free floor always applies first: any transcript
+   under 80 characters is skipped unconditionally (a ledger row with 0
+   candidates is still recorded, so it isn't rescanned every run). Above that
+   floor, the default mode (`AGENT_MEMORY_TRIAGE=llm`) asks a cheap LLM call
+   whether the transcript is worth a full pass; `AGENT_MEMORY_TRIAGE=heuristic`
+   instead applies the old body-length-only gate (skip under 400 characters,
+   no LLM call). **Triage fails open**: an LLM error, non-JSON reply, or a
+   JSON shape missing the boolean field logs a note to stderr and lets the
+   transcript through to EXTRACT anyway — a gatekeeping hiccup can never
+   silently drop knowledge, quality-first per design.
+3. **EXTRACT ×N** — `AGENT_MEMORY_EXTRACT_RUNS` (default 2) independent,
+   sequential big-model calls per transcript, each strict-JSON-array output
+   against the 6-type taxonomy (`decision`, `root_cause`, `pitfall`,
+   `know_how`, `convention`, `workflow`) and each validated on its own (see
+   VALIDATE below) so one run's schema garbage can't poison the others. A
+   single run erroring is logged and tolerated; only if *every* run errors
+   does the transcript fail (counted in `errors`, not ledgered — retried on
+   the next scheduled run). Self-reported `salience` below
+   `AGENT_MEMORY_SALIENCE_MIN` is silently dropped inside each run, same as
+   before the quality pack.
+4. **VALIDATE** (deterministic, no LLM, per run) — per-field schema, every
+   evidence `message_id` must match a real `{#msg_id}` anchor in the
+   transcript (a hallucinated anchor rejects the candidate), `lesson` ≤ 80
+   words, and a secret/high-entropy-token scan — a hit sends the candidate to
+   quarantine instead of rejecting it.
+5. **POOL-DEDUP** — the valid candidates from all N extraction runs are
+   unioned (concatenated in run order) and deterministically deduplicated:
+   two candidates merge when they share the same `type` AND either their
+   titles' token-set Jaccard similarity is `>= 0.6` or their `trigger` is
+   identical; the merge keeps the longer `lesson`, unions `evidence`
+   (deduped by `message_id`) and `domain`, takes the max `salience`, and ORs
+   `volatile`. Dedup is a greedy left-to-right scan — each candidate merges
+   into the *first* existing pool member it duplicates — so it is
+   **deterministic only if run order is preserved**; runs must stay
+   concatenated in run-index order for reproducible pooling. Secret-flagged
+   candidates go through the same merge rule in a separate pool before being
+   quarantined.
+6. **JUDGE** — when `AGENT_MEMORY_JUDGES` > 0 (default 3), each pooled
+   candidate gets an independent salience re-score from that many sequential
+   LLM judge calls; the panel's median vote (lower-middle on a tie for an
+   even panel size) replaces the extractor's self-reported salience, and a
+   candidate whose consensus falls below `AGENT_MEMORY_SALIENCE_MIN` is
+   dropped at this stage (same silent-drop semantics as the EXTRACT
+   self-score threshold). A judge call that errors or returns unparseable/
+   out-of-range JSON abstains rather than voting; if *every* judge in the
+   panel abstains, the candidate's own self-score stands unchanged
+   (`AGENT_MEMORY_JUDGES=0` skips this stage entirely — same effect as an
+   all-abstain panel, but with zero LLM calls).
+7. **RECONCILE** (Mem0-style) — FTS-query the top 5 similar `active` memories,
    then an LLM call picks exactly one of `ADD` / `UPDATE` / `SUPERSEDE` /
    `NOOP`. `SUPERSEDE` marks the old entry `status: superseded` and sets its
    `superseded_by`; entries are never deleted.
-6. **COMMIT** — write/update the memory markdown file(s) and append a ledger
+8. **COMMIT** — write/update the memory markdown file(s) and append a ledger
    row recording candidate/committed counts.
-7. **PUBLISH** — regenerate `store/INDEX.md`, a human-readable catalog grouped
+9. **PUBLISH** — regenerate `store/INDEX.md`, a human-readable catalog grouped
    by project, sorted by type then confidence (descending). This only happens
    at the end of `distill run` — `reindex`/`review`/`stats` don't touch it.
+
+### Extraction quality pack (triage / self-consistency / judge)
+
+All three features are quality-first and **default ON** — no configuration
+needed to get the higher-quality behavior. Full design:
+`docs/superpowers/specs/2026-07-11-quality-pack-design.md`.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `AGENT_MEMORY_TRIAGE` | `llm` | `llm` asks a cheap LLM call whether a transcript is worth extracting (fails open on any error); `heuristic` reverts to the pre-quality-pack body-length-only gate (skip under 400 chars, no LLM call). The unconditional 80-char hard floor applies in both modes. |
+| `AGENT_MEMORY_EXTRACT_RUNS` | `2` | Number of independent EXTRACT calls per transcript, unioned and deduplicated by POOL-DEDUP for self-consistency. Must be an integer in `[1, 5]`. `1` reproduces pre-quality-pack single-pass extraction. |
+| `AGENT_MEMORY_JUDGES` | `3` | Size of the judge panel that re-scores each pooled candidate's salience by median consensus. Must be an integer in `[0, 5]`. `0` skips judging entirely — the extractor's self-reported salience stands, same as before the quality pack. |
+
+All three are read once at the CLI layer (`distiller/cli.ts`) and passed as
+explicit `PipelineOptions` — `pipeline.ts` itself never reads `process.env`,
+so the same behavior is reachable (and testable) without env vars by passing
+`{ triage, extractRuns, judges }` directly. Bad values (non-numeric run/judge
+counts, out-of-range, or a triage mode that isn't `llm`/`heuristic`) fail
+fast with a friendly error and exit code 1 rather than silently falling back
+to a default.
+
+**Fail-open, everywhere.** The quality pack never turns an LLM hiccup into
+lost knowledge: triage errors let the transcript through; a failed EXTRACT
+run is tolerated as long as at least one of the N runs succeeds; an
+all-abstain judge panel leaves the extractor's own score standing. The only
+way a transcript produces zero memories is a triage `worth_extracting: false`
+verdict, *all* EXTRACT runs failing, or every candidate scoring below
+`AGENT_MEMORY_SALIENCE_MIN` after validation/judging — never a bare
+infrastructure error.
+
+**Legacy (pre-quality-pack) behavior**, for reproducing the old single-pass
+pipeline exactly (e.g. comparing against historical `results.jsonl`
+baselines):
+
+```bash
+AGENT_MEMORY_TRIAGE=heuristic AGENT_MEMORY_EXTRACT_RUNS=1 AGENT_MEMORY_JUDGES=0 \
+  bun run distill run
+```
+
+**Cost/latency note:** the defaults mean every eligible transcript costs
+roughly `1 (triage) + 2 (extract) + 3 × candidates (judge)` LLM calls instead
+of 1 — a `distill run` over a real transcript spool with the defaults takes
+several minutes on the `opencode-run` dev backend, vs. seconds per transcript
+in legacy mode. Budget accordingly for nightly cron/launchd runs (see
+Scheduling below) and prefer a self-hosted vLLM backend for production
+volume.
 
 ### CLI usage
 
@@ -294,6 +378,9 @@ their SUPERSEDEs still apply automatically, with no review step.
 | `AGENT_MEMORY_VLLM_KEY` | *(none)* | Optional bearer token, sent as `Authorization: Bearer <key>` when set. |
 | `AGENT_MEMORY_IDLE_HOURS` | `6` | Minimum hours since a transcript's `time_end` before it becomes eligible. Must be `>= 0`. |
 | `AGENT_MEMORY_SALIENCE_MIN` | `6` | Minimum salience (0-10) an extracted candidate must score to survive; below this it's dropped, not rejected. Must be in `[0, 10]`. |
+| `AGENT_MEMORY_TRIAGE` | `llm` | `llm` \| `heuristic` — see "Extraction quality pack" below. |
+| `AGENT_MEMORY_EXTRACT_RUNS` | `2` | Integer `[1, 5]` — self-consistency extraction runs per transcript, see below. |
+| `AGENT_MEMORY_JUDGES` | `3` | Integer `[0, 5]` — judge panel size for salience consensus, see below. |
 
 `AGENT_MEMORY_HOME` (see the collector's Configuration table above) is shared
 — it also determines `store/` and `transcripts/` for the distiller.
@@ -604,6 +691,8 @@ and scores the result.
 bun run eval                    # both suites: extraction + retrieval
 bun run eval --extraction-only  # only the 3 fixture cases (calls the LLM, seconds-to-minutes)
 bun run eval --retrieval-only   # only the 4 golden queries (no LLM, <1s)
+bun run eval --extraction-only --runs 3               # 3 independent runs per fixture, default pass-rate 1.0
+bun run eval --extraction-only --runs 3 --pass-rate 0.8  # a fixture passes at 0.8 (e.g. 3/3 or 2/3, not 1/3)
 ```
 
 Exit code `0` when everything passes, `1` on any failure — CI-compatible.
@@ -617,6 +706,30 @@ diff is a two-line comparison tool, not an audit log of every invocation.
 `--retrieval-only` never appends to `results.jsonl` regardless — a retrieval
 smoke check makes zero LLM calls and carries no model/prompt/threshold
 signal, so it isn't a model eval worth tracking in that history.
+
+### `--runs N` / `--pass-rate X` — multi-run stability
+
+`--runs N` (extraction suite only; default `1`, range `[1, 10]`) runs each
+fixture `N` independent times (fresh LLM call + validate + score each time)
+and computes a per-fixture `passes/N` rate; a fixture passes overall iff that
+rate is `>= --pass-rate` (default `1.0`, i.e. every run must pass — identical
+to pre-quality-pack behavior when `--runs` is left at its default of `1`). An
+erroring run counts against the rate (a failed run is a failed run) but is
+also tallied separately in `errors`. The scorecard line becomes
+`✓/✗ <fixture> — pass-rate 3/3` (or `2/3 (< required 3/3)` when the
+threshold isn't met), and the `eval/results.jsonl` extraction object gains
+`runs` and a per-fixture `fixturePassRates: { [fixture]: rate }` map when
+`--runs > 1`.
+
+**Cross-run aggregation nuance:** `expectationsMet` / `expectationsTotal` /
+`forbiddenHits` / `extras` in the scorecard and in `results.jsonl` are
+**summed across all N runs of a fixture**, not averaged and not per-run —
+e.g. `--runs 3` on a fixture with 4 expectation rules can show
+`expectationsMet: 11/12` if two runs matched all 4 and one run matched 3.
+Only `fixturesPass`/`fixturesTotal` and the new `fixturePassRates` reflect
+the run-level pass/fail semantics; the expectation counters are a coarser,
+summed signal layered on top, not a substitute for reading the per-fixture
+pass-rate.
 
 ### `eval/cases.json` — extraction expectations
 
@@ -702,8 +815,13 @@ threshold) is exactly what this harness exists to gate:
 ```bash
 # baseline already in eval/results.jsonl (opencode-run backend)
 AGENT_MEMORY_LLM=vllm AGENT_MEMORY_VLLM_URL=http://... AGENT_MEMORY_VLLM_MODEL=... \
-  bun run eval --extraction-only
+  bun run eval --extraction-only --runs 3
 ```
+
+Prefer `--runs 3` (or more) over a bare single run for this comparison — it
+folds the "run it twice, only trust a repeatable difference" advice below
+into one invocation's `fixturePassRates`, and gives you a stability number
+(`2/3`, `3/3`) instead of a single noisy pass/fail per fixture.
 
 Then diff the new `eval/results.jsonl` line against the baseline line —
 `model` changes, and `extraction.{fixturesPass,expectationsMet,errors}`
@@ -733,8 +851,10 @@ collector/  db.ts (read-only bundle load), transcript.ts (render), export.ts (sk
             plugin.ts (session.idle hook), plugin-entry.ts (bundle entrypoint — exports only
             the plugin, per the opencode loader's function-exports-only contract), backfill.ts (CLI)
 distiller/  cli.ts (run/reindex/review/approve/reject/stats), pipeline.ts (stage orchestration),
-            transcripts.ts (spool scan/parse), extract.ts (prompt + validation), reconcile.ts
-            (Mem0-style ADD/UPDATE/SUPERSEDE/NOOP, decision/convention SUPERSEDE interception),
+            transcripts.ts (spool scan/parse), extract.ts (prompt + validation), triage.ts
+            (LLM pre-filter gate, fail-open), pool.ts (deterministic self-consistency dedup/merge),
+            judge.ts (multi-judge median salience consensus), reconcile.ts (Mem0-style
+            ADD/UPDATE/SUPERSEDE/NOOP, decision/convention SUPERSEDE interception),
             reviewops.ts (approveEntry/rejectEntry — the human review loop), quarantine.ts
             (shared uniquified quarantine writer), store.ts (markdown entry read/write), ledger.ts
             (sqlite index + idempotency + trigram FTS), llm.ts (vllm / opencode-run clients)
@@ -753,8 +873,10 @@ See `docs/superpowers/specs/2026-07-10-agent-memory-design.md` for the full
 architecture, `docs/superpowers/specs/2026-07-11-regression-eval-design.md`
 for the eval harness design,
 `docs/superpowers/specs/2026-07-11-sqlite-optional-design.md` for the
-sqlite-optional design, `docs/superpowers/VERIFY.md` for the collector's
-manual verification checklist, `docs/superpowers/VERIFY-distiller.md` for the
-distiller's, `docs/superpowers/VERIFY-mcp.md` for the mcp-server's,
-`docs/superpowers/VERIFY-eval.md` for the eval harness's, and
-`docs/superpowers/VERIFY-sqlite-optional.md` for the sqlite-optional mode's.
+sqlite-optional design, `docs/superpowers/specs/2026-07-11-quality-pack-design.md`
+for the extraction quality pack design, `docs/superpowers/VERIFY.md` for the
+collector's manual verification checklist, `docs/superpowers/VERIFY-distiller.md`
+for the distiller's, `docs/superpowers/VERIFY-mcp.md` for the mcp-server's,
+`docs/superpowers/VERIFY-eval.md` for the eval harness's,
+`docs/superpowers/VERIFY-sqlite-optional.md` for the sqlite-optional mode's,
+and `docs/superpowers/VERIFY-quality-pack.md` for the quality pack's.

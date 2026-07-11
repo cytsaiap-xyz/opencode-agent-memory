@@ -17,3 +17,4 @@
 {"ts":"2026-07-11T08:37:11.821Z","model":"opencode-run","extraction":{"fixturesPass":2,"fixturesTotal":3,"expectationsMet":3,"expectationsTotal":4,"forbiddenHits":0,"extras":0,"errors":0},"pass":false}
 {"ts":"2026-07-11T08:40:37.261Z","model":"opencode-run","extraction":{"fixturesPass":3,"fixturesTotal":3,"expectationsMet":4,"expectationsTotal":4,"forbiddenHits":0,"extras":3,"errors":0},"pass":true}
 {"ts":"2026-07-11T08:41:54.482Z","model":"opencode-run","extraction":{"fixturesPass":3,"fixturesTotal":3,"expectationsMet":4,"expectationsTotal":4,"forbiddenHits":0,"extras":3,"errors":0},"pass":true}
+{"ts":"2026-07-11T12:01:20.096Z","model":"opencode-run","extraction":{"fixturesPass":2,"fixturesTotal":3,"expectationsMet":10,"expectationsTotal":12,"forbiddenHits":0,"extras":6,"errors":0,"runs":3,"fixturePassRates":{"ppa-timing-closure.md":1,"monetary-decimal.md":0.3333333333333333,"noise-chitchat.md":1}},"pass":false}
