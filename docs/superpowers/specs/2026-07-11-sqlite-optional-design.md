@@ -45,7 +45,7 @@ O(n) without bm25 ranking, access stats disabled, ledger uses ledger.jsonl`
 | FTS search (bm25 + trigram) | mcp search_memory, reconcile neighbors, review | **markdown scan**: walk `listEntryPaths` + parse, deterministic keyword scoring (see §4), same filter semantics (status/confidence/project/type/domain) |
 | getById | mcp get_memory, reviewops, quarantine uniquify | **filename scan**: id === basename; walk memories/ + quarantine/ |
 | stats (byStatus/byType) | cli stats, mcp memory_stats | **markdown scan** counts |
-| processed-sessions ledger | distiller idempotency | **`<storeDir>/ledger.jsonl`** append-only file (§5) — idempotency is a COST-SAFETY property and must never be silently dropped |
+| processed-sessions ledger | distiller idempotency | **`<storeDir>/ledger.jsonl`** append-only file (§5) — idempotency is kept not for token cost (internal vLLM, tokens are free — quality-first environment, confirmed 2026-07-11) but for CORRECTNESS: without it every nightly run re-extracts all history, multiplying wall-clock and churning existing memories with "re-extracted" update noise |
 | lastProcessedAt / sessions count | stats | from ledger.jsonl |
 | access_count / last_accessed | mcp recordAccess, ranking signal | **switched off** (recordAccess = no-op; stats report `access: unavailable`) — the only capability genuinely lost |
 | rebuildFrom / reindex | cli reindex | **no-op with notice** (nothing to rebuild; markdown IS the store) |
