@@ -8,6 +8,7 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "distill": "bun distiller/cli.ts",
+    "eval": "bun eval/run.ts",
     "mcp": "bun mcp-server/main.ts",
     "mcp:probe": "bun mcp-server/probe.ts"
   },
