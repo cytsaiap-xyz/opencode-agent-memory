@@ -1,0 +1,6 @@
+[
+  { "query": "useful skew setup timing", "expect_id": "mem_20260710_8cd55e", "within_top": 3 },
+  { "query": "Decimal monetary float", "expect_id": "mem_20260710_624036", "within_top": 1 },
+  { "query": "synthesis slack multiplier", "expect_id": "mem_20260710_95cd04", "within_top": 3 },
+  { "query": "時序收斂", "expect_id": "mem_20260711_cjk001", "within_top": 3 }
+]

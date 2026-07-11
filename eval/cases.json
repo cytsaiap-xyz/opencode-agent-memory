@@ -1,0 +1,28 @@
+[
+  {
+    "fixture": "ppa-timing-closure.md",
+    "expect": [
+      { "type": "decision", "keywords": ["useful skew"] },
+      { "type": "pitfall", "keywords": ["synthesis"] },
+      { "keywords": ["retiming"] }
+    ],
+    "forbid": [
+      { "keywords": ["lunch"] },
+      { "keywords": ["joke"] }
+    ],
+    "max_extra": 8
+  },
+  {
+    "fixture": "monetary-decimal.md",
+    "expect": [
+      { "keywords": ["Decimal"] }
+    ],
+    "forbid": [],
+    "max_extra": 8
+  },
+  {
+    "fixture": "noise-chitchat.md",
+    "expect": [],
+    "max_total": 0
+  }
+]
