@@ -69,7 +69,8 @@ export async function runCli(
           out(
             `distill done: ${s.ops.added} added, ${s.ops.updated} updated, ${s.ops.superseded} superseded, ` +
               `${s.ops.nooped} nooped, ${s.quarantined} quarantined, ${s.rejected} rejected, ${s.errors} errors ` +
-              `(scanned ${s.scanned}, eligible ${s.eligible}, already-done ${s.skippedProcessed}, triaged ${s.triagedOut})`,
+              `(scanned ${s.scanned}, eligible ${s.eligible}, already-done ${s.skippedProcessed}, triaged ${s.triagedOut}, ` +
+              `pool ${s.poolRaw}->${s.candidates}, triaged llm:${s.triagedLlm}/heur:${s.triagedHeuristic})`,
           )
           return s.errors > 0 ? 2 : 0
         } finally {

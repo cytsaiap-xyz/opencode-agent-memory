@@ -669,6 +669,51 @@ describe("runEval", () => {
     expect(summary.extraction!.expectationsMet).toBe(3) // 1 met per run * 3 runs
   })
 
+  it("FIX 1 (display regression): two-fixture eval dir — each per-fixture line prints ITS OWN counts, not the cumulative running total", async () => {
+    // Mini eval dir: two fixtures, one expectation each, no retrieval setup needed since
+    // mode: "extraction" never touches the retrieval directory.
+    const evalDir = join(tmpDir, "two-fixture-eval")
+    mkdirSync(join(evalDir, "fixtures"), { recursive: true })
+    writeFileSync(join(evalDir, "fixtures", "a.md"), createTranscript("ses_a"))
+    writeFileSync(join(evalDir, "fixtures", "b.md"), createTranscript("ses_b"))
+    writeFileSync(
+      join(evalDir, "cases.json"),
+      JSON.stringify([
+        { fixture: "a.md", expect: [{ keywords: ["decision"] }], forbid: [] },
+        { fixture: "b.md", expect: [{ keywords: ["decision"] }], forbid: [] },
+      ]),
+    )
+
+    // FakeLlm's default (unscripted) response is the same "Test Decision" candidate for
+    // every call, which satisfies the "decision" keyword rule on both fixtures.
+    const llm = new FakeLlm()
+    const capturedLines: string[] = []
+    const summary = await runEval({
+      evalDir,
+      llm,
+      mode: "extraction",
+      resultsPath: null,
+      out: (line) => capturedLines.push(line),
+    })
+
+    expect(summary.extraction!.fixturesPass).toBe(2)
+    expect(summary.extraction!.fixturesTotal).toBe(2)
+    // Cumulative totals across both fixtures are correctly 2/2 in the summary object...
+    expect(summary.extraction!.expectationsMet).toBe(2)
+    expect(summary.extraction!.expectationsTotal).toBe(2)
+
+    const lineA = capturedLines.find((l) => l.includes("a.md"))
+    const lineB = capturedLines.find((l) => l.includes("b.md"))
+    expect(lineA).toBeDefined()
+    expect(lineB).toBeDefined()
+    // ...but each fixture has exactly ONE expectation of its own — before the fix,
+    // fixture 2's printed line showed the cumulative running total (2/2) instead of its
+    // own per-fixture count (1/1).
+    expect(lineA).toContain("expectations 1/1")
+    expect(lineB).toContain("expectations 1/1")
+    expect(lineB).not.toContain("expectations 2/2")
+  })
+
   it("FIX 2: error diagnostics printed for every run with run prefix", async () => {
     const evalDir = setupEvalDir(tmpDir)
     const llm = new FakeLlm()
@@ -813,5 +858,48 @@ describe("runEval", () => {
     expect(fixtureLine).toContain("✗")
     expect(fixtureLine).toContain("0/3")
     expect(fixtureLine).toContain("< required")
+  })
+
+  // ============ FIX 6: CLI arg validation ============
+  //
+  // These exercise the `if (import.meta.main)` block in eval/run.ts, which only runs when
+  // the file is executed directly — spawned as a real subprocess (matches the pattern in
+  // distiller/indexes.test.ts). Validation happens before runEval() is ever called, so no
+  // eval dir / cases.json / LLM setup is needed: a bad arg exits 1 before touching the
+  // filesystem.
+
+  it("CLI: --runs 3.5 (non-integer) is rejected with a friendly error, not silently truncated to 3", async () => {
+    // parseInt("3.5", 10) === 3, and Number.isInteger(3) is true — the old check let a
+    // fractional --runs value through silently truncated instead of rejecting it.
+    const proc = Bun.spawn({
+      cmd: ["bun", join(import.meta.dir, "run.ts"), "--extraction-only", "--runs", "3.5"],
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited])
+    expect(exitCode).toBe(1)
+    expect(stderr).toContain("--runs must be an integer")
+  })
+
+  it("CLI: --runs with no following value is rejected with a friendly error", async () => {
+    const proc = Bun.spawn({
+      cmd: ["bun", join(import.meta.dir, "run.ts"), "--extraction-only", "--runs"],
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited])
+    expect(exitCode).toBe(1)
+    expect(stderr).toContain("--runs needs a value")
+  })
+
+  it("CLI: --pass-rate with no following value is rejected with a friendly error", async () => {
+    const proc = Bun.spawn({
+      cmd: ["bun", join(import.meta.dir, "run.ts"), "--extraction-only", "--pass-rate"],
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited])
+    expect(exitCode).toBe(1)
+    expect(stderr).toContain("--pass-rate needs a value")
   })
 })

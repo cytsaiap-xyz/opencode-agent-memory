@@ -104,6 +104,16 @@ async function runExtraction(
     let passes = 0
     let fixtureErrors = 0
 
+    // FIX 1: expectationsMet/expectationsTotal/forbiddenHits/extras below are running
+    // totals accumulated across ALL fixtures in the eval dir (needed for the scorecard
+    // totals line and results.jsonl). The runs===1 per-fixture line must print THIS
+    // fixture's own counts, not the cumulative-so-far counts — snapshot the totals as
+    // they stood before this fixture's runs and diff against them below.
+    const expectationsMetBefore = expectationsMet
+    const expectationsTotalBefore = expectationsTotal
+    const forbiddenHitsBefore = forbiddenHits
+    const extrasBefore = extras
+
     for (let runIdx = 0; runIdx < runs; runIdx++) {
       try {
         const content = readFileSync(fixturePath, "utf8")
@@ -140,8 +150,12 @@ async function runExtraction(
     const rateStr = `${passes}/${runs}`
 
     if (runs === 1) {
+      const fixtureExpectationsMet = expectationsMet - expectationsMetBefore
+      const fixtureExpectationsTotal = expectationsTotal - expectationsTotalBefore
+      const fixtureForbiddenHits = forbiddenHits - forbiddenHitsBefore
+      const fixtureExtras = extras - extrasBefore
       out(
-        `${symbol} ${kase.fixture} — expectations ${expectationsMet}/${expectationsTotal}, forbidden ${forbiddenHits}, extras ${extras}`,
+        `${symbol} ${kase.fixture} — expectations ${fixtureExpectationsMet}/${fixtureExpectationsTotal}, forbidden ${fixtureForbiddenHits}, extras ${fixtureExtras}`,
       )
     } else {
       if (fixturePass) {
@@ -310,10 +324,21 @@ if (import.meta.main) {
 
   // Parse --runs N
   const runsIdx = args.indexOf("--runs")
-  if (runsIdx >= 0 && runsIdx + 1 < args.length) {
-    const runsStr = args[runsIdx + 1]!
-    const parsed = parseInt(runsStr, 10)
-    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 10) {
+  if (runsIdx >= 0) {
+    const runsStr = args[runsIdx + 1]
+    if (runsStr === undefined) {
+      console.error("Error: --runs needs a value")
+      process.exit(1)
+    }
+    // parseInt("3.5", 10) silently truncates to 3 (an integer), so a Number.isInteger
+    // check on the *parsed* value can't catch a non-integer string like "3.5" — validate
+    // the raw string shape first.
+    if (!/^\d+$/.test(runsStr)) {
+      console.error(`Error: --runs must be an integer between 1 and 10, got ${runsStr}`)
+      process.exit(1)
+    }
+    const parsed = Number(runsStr)
+    if (parsed < 1 || parsed > 10) {
       console.error(`Error: --runs must be an integer between 1 and 10, got ${runsStr}`)
       process.exit(1)
     }
@@ -326,8 +351,12 @@ if (import.meta.main) {
 
   // Parse --pass-rate X
   const passRateIdx = args.indexOf("--pass-rate")
-  if (passRateIdx >= 0 && passRateIdx + 1 < args.length) {
-    const passRateStr = args[passRateIdx + 1]!
+  if (passRateIdx >= 0) {
+    const passRateStr = args[passRateIdx + 1]
+    if (passRateStr === undefined) {
+      console.error("Error: --pass-rate needs a value")
+      process.exit(1)
+    }
     const parsed = parseFloat(passRateStr)
     if (Number.isNaN(parsed) || parsed <= 0 || parsed > 1) {
       console.error(`Error: --pass-rate must be a number in (0, 1], got ${passRateStr}`)

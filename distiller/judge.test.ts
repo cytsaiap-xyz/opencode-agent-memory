@@ -152,6 +152,20 @@ test("judgeCandidate: judges=0 returns immediate fallback with zero LLM calls", 
   expect(llm.callCount).toBe(0)
 })
 
+test("judgeCandidate: judges=1 also returns immediate fallback with zero LLM calls (spec: N=0 or 1 disables)", async () => {
+  const llm = new FakeLlm()
+  const candidate = cand({ salience: 6 })
+
+  const verdict = await judgeCandidate(candidate, llm, 1)
+
+  expect(verdict.salience).toBe(6)
+  expect(verdict.panel).toBe(0)
+  expect(verdict.voted).toBe(0)
+  expect(verdict.selfScore).toBe(6)
+  expect(verdict.usedFallback).toBe(true)
+  expect(llm.callCount).toBe(0)
+})
+
 test("judgeCandidate: judges < 0 returns immediate fallback with zero LLM calls", async () => {
   const llm = new FakeLlm()
   const candidate = cand({ salience: 5 })

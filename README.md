@@ -216,7 +216,7 @@ INGEST → TRIAGE(llm) → EXTRACT×N → VALIDATE → POOL-DEDUP → JUDGE → 
    concatenated in run-index order for reproducible pooling. Secret-flagged
    candidates go through the same merge rule in a separate pool before being
    quarantined.
-6. **JUDGE** — when `AGENT_MEMORY_JUDGES` > 0 (default 3), each pooled
+6. **JUDGE** — when `AGENT_MEMORY_JUDGES` > 1 (default 3), each pooled
    candidate gets an independent salience re-score from that many sequential
    LLM judge calls; the panel's median vote (lower-middle on a tie for an
    even panel size) replaces the extractor's self-reported salience, and a
@@ -225,8 +225,10 @@ INGEST → TRIAGE(llm) → EXTRACT×N → VALIDATE → POOL-DEDUP → JUDGE → 
    self-score threshold). A judge call that errors or returns unparseable/
    out-of-range JSON abstains rather than voting; if *every* judge in the
    panel abstains, the candidate's own self-score stands unchanged
-   (`AGENT_MEMORY_JUDGES=0` skips this stage entirely — same effect as an
-   all-abstain panel, but with zero LLM calls).
+   (`AGENT_MEMORY_JUDGES=0` OR `1` skips this stage entirely — a single
+   judge adds cost with no consensus benefit over self-score, so it's
+   treated the same as "off" — same effect as an all-abstain panel, but
+   with zero LLM calls).
 7. **RECONCILE** (Mem0-style) — FTS-query the top 5 similar `active` memories,
    then an LLM call picks exactly one of `ADD` / `UPDATE` / `SUPERSEDE` /
    `NOOP`. `SUPERSEDE` marks the old entry `status: superseded` and sets its
@@ -247,7 +249,7 @@ needed to get the higher-quality behavior. Full design:
 |---|---|---|
 | `AGENT_MEMORY_TRIAGE` | `llm` | `llm` asks a cheap LLM call whether a transcript is worth extracting (fails open on any error); `heuristic` reverts to the pre-quality-pack body-length-only gate (skip under 400 chars, no LLM call). The unconditional 80-char hard floor applies in both modes. |
 | `AGENT_MEMORY_EXTRACT_RUNS` | `2` | Number of independent EXTRACT calls per transcript, unioned and deduplicated by POOL-DEDUP for self-consistency. Must be an integer in `[1, 5]`. `1` reproduces pre-quality-pack single-pass extraction. |
-| `AGENT_MEMORY_JUDGES` | `3` | Size of the judge panel that re-scores each pooled candidate's salience by median consensus. Must be an integer in `[0, 5]`. `0` skips judging entirely — the extractor's self-reported salience stands, same as before the quality pack. |
+| `AGENT_MEMORY_JUDGES` | `3` | Size of the judge panel that re-scores each pooled candidate's salience by median consensus. Must be an integer in `[0, 5]`. `0` OR `1` skips judging entirely — the extractor's self-reported salience stands, same as before the quality pack. |
 
 All three are read once at the CLI layer (`distiller/cli.ts`) and passed as
 explicit `PipelineOptions` — `pipeline.ts` itself never reads `process.env`,
@@ -297,8 +299,12 @@ bun run distill stats                    # print counts by status/type + session
 `run` prints a one-line summary, e.g.:
 
 ```
-distill done: 3 added, 1 updated, 0 superseded, 2 nooped, 1 quarantined, 0 rejected, 0 errors (scanned 12, eligible 8, already-done 5, triaged 1)
+distill done: 3 added, 1 updated, 0 superseded, 2 nooped, 1 quarantined, 0 rejected, 0 errors (scanned 12, eligible 8, already-done 5, triaged 1, pool 5->4, triaged llm:1/heur:0)
 ```
+
+`pool <raw>-><deduped>` is `poolRaw`/`candidates` (the pre-/post-POOL-DEDUP candidate
+counts, see the quality pack section above); `triaged llm:<L>/heur:<H>` splits the
+`triaged` total by which triage mode actually skipped the transcript.
 
 Exit codes: `0` success, `1` bad usage/config (unknown command, missing
 `--project` value, invalid env value), `2` one or more transcripts errored
@@ -380,7 +386,7 @@ their SUPERSEDEs still apply automatically, with no review step.
 | `AGENT_MEMORY_SALIENCE_MIN` | `6` | Minimum salience (0-10) an extracted candidate must score to survive; below this it's dropped, not rejected. Must be in `[0, 10]`. |
 | `AGENT_MEMORY_TRIAGE` | `llm` | `llm` \| `heuristic` — see "Extraction quality pack" below. |
 | `AGENT_MEMORY_EXTRACT_RUNS` | `2` | Integer `[1, 5]` — self-consistency extraction runs per transcript, see below. |
-| `AGENT_MEMORY_JUDGES` | `3` | Integer `[0, 5]` — judge panel size for salience consensus, see below. |
+| `AGENT_MEMORY_JUDGES` | `3` | Integer `[0, 5]` — judge panel size for salience consensus, see below. `0` or `1` disables. |
 
 `AGENT_MEMORY_HOME` (see the collector's Configuration table above) is shared
 — it also determines `store/` and `transcripts/` for the distiller.

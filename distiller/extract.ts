@@ -7,6 +7,12 @@ export interface Candidate {
   type: MemoryType; title: string; trigger: string; lesson: string
   domain: string[]; evidence: Array<{ message_id: string }>
   salience: number; volatile: boolean
+  // Internal-only: set by the pipeline's JUDGE stage (see judge.ts / pipeline.ts) to
+  // record per-candidate judge provenance (median score + panel voting, or the
+  // all-abstain fallback). Never populated by the LLM extractor itself, so it is
+  // deliberately excluded from EXTRACT_SCHEMA below — the schema only describes what we
+  // ask the model to produce.
+  judgeNote?: string
 }
 
 const TYPES: readonly MemoryType[] = ["decision", "root_cause", "pitfall", "know_how", "convention", "workflow"]

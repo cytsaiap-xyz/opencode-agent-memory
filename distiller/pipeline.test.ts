@@ -316,6 +316,33 @@ test("extractRuns=2: union of both runs' candidates lands in the pool (run1 miss
   expect(index.search("Bravo Timeout", { status: "active" }).length).toBe(1)
 })
 
+test("extractRuns=2: the SAME secret candidate in both runs dedupes to exactly one quarantine file", async () => {
+  const { cfg, index } = setup()
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcript("ses_1", "sha256:h1", "leaky both runs"))
+  // Both extraction runs independently "discover" the identical secret candidate — this
+  // is the realistic shape (extractRuns re-prompts the same transcript, so a real secret
+  // in the transcript gets flagged by every run that spots it), and dedupSecrets (the
+  // secret-pool sibling of dedupPool) must merge them into a single quarantine write
+  // instead of one per run.
+  const secretJson = candidateJson("AWS Key Setup", "Never set AKIA0123456789ABCDEF as env var.")
+  const llm = scriptedLlm([secretJson, secretJson])
+  const s = await runPipeline(cfg, { llm, index }, { now: NOW, triage: "heuristic", extractRuns: 2, judges: 0 })
+  expect(s.quarantined).toBe(1)
+  const quarantineDir = join(cfg.storeDir, "quarantine")
+  const files = readdirSync(quarantineDir)
+  expect(files.length).toBe(1)
+})
+
+test("judges=0: no per-entry judge note (legacy self-score stands, judge branch never runs)", async () => {
+  const { cfg, index } = setup()
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcript("ses_1", "sha256:h1", "no judging"))
+  const llm = scriptedLlm([candidateJson("No Judge Note", "Do the thing.")])
+  const s = await runPipeline(cfg, { llm, index }, { now: NOW, triage: "heuristic", extractRuns: 1, judges: 0 })
+  expect(s.ops.added).toBe(1)
+  const hit = index.search("No Judge Note", { status: "active" })[0]!
+  expect(hit.entry.notes.some((n) => n.includes("judged:"))).toBe(false)
+})
+
 test("extractRuns=2: one run erroring is tolerated (logged), the other run's candidates still commit", async () => {
   const { cfg, index } = setup()
   writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcript("ses_1", "sha256:h1", "flaky extraction"))
@@ -341,7 +368,7 @@ test("extractRuns=2: ALL runs erroring fails the transcript (errors++, not ledge
   expect(retry.ops.added).toBe(1)
 })
 
-test("judges: drops a low-median candidate, keeps a high-median one, extractor label reflects judge count", async () => {
+test("judges: drops a low-median candidate, keeps a high-median one, records per-candidate judge note (not a run-level label suffix)", async () => {
   const { cfg, index } = setup()
   writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcript("ses_1", "sha256:h1", "mixed quality session"))
   // Non-overlapping vocabulary (see the extractRuns=2 test above for why) — also matters
@@ -359,7 +386,11 @@ test("judges: drops a low-median candidate, keeps a high-median one, extractor l
   expect(index.search("Trivial Aside", { status: "active" }).length).toBe(0)
   const kept = index.search("Critical Root Cause", { status: "active" })
   expect(kept.length).toBe(1)
-  expect(kept[0]!.entry.provenance.extractor).toContain("judges:3")
+  // The run-level " judges:N" suffix is gone from the extractor label...
+  expect(kept[0]!.entry.provenance.extractor).not.toContain("judges:")
+  // ...replaced by a per-candidate judge note on the entry itself (median of [7,8,9]=8,
+  // 3/3 judges voted).
+  expect(kept[0]!.entry.notes.some((n) => n.includes("judged: median 8 (3/3)"))).toBe(true)
 })
 
 test("full quality-pack defaults (triage llm, extractRuns 2, judges 3) run end to end", async () => {
@@ -379,5 +410,7 @@ test("full quality-pack defaults (triage llm, extractRuns 2, judges 3) run end t
   expect(s.ops.added).toBe(1)
   expect(llm.calls).toBe(6)
   const hit = index.search("Full Pack Candidate", { status: "active" })[0]!
-  expect(hit.entry.provenance.extractor).toContain("judges:3")
+  expect(hit.entry.provenance.extractor).not.toContain("judges:")
+  // median of [6,7,8] = 7 (odd, middle value), 3/3 judges voted.
+  expect(hit.entry.notes.some((n) => n.includes("judged: median 7 (3/3)"))).toBe(true)
 })

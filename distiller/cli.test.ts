@@ -49,6 +49,14 @@ test("run distills and prints summary; stats and review reflect state", async ()
   writeFileSync(join(dir, "transcripts", "proja", "ses_1.md"), transcript)
   expect(await runCli(["run"], env, { ...deps, llm })).toBe(0)
   expect(out.join("\n")).toContain("1 added")
+  // FIX 5: summary line additionally surfaces pool raw->deduped and the triage split.
+  // Defaults (triage llm, extractRuns 2, judges 3): the fixed `llm` always returns the
+  // same candidate array — the triage call parses it as an invalid triage shape and fails
+  // open (not counted in either triage bucket), the 2 extract runs both find the same
+  // candidate (poolRaw 2 -> deduped to 1), and all 3 judges abstain (same array isn't a
+  // valid judge JSON shape either) so the candidate's self-score stands.
+  expect(out.join("\n")).toContain("pool 2->1")
+  expect(out.join("\n")).toContain("triaged llm:0/heur:0")
 
   out.length = 0
   expect(await runCli(["stats"], env, deps)).toBe(0)

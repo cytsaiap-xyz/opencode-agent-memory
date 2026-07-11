@@ -80,8 +80,12 @@ export async function runPipeline(
   const triageMode = opts.triage ?? "llm"
   const extractRuns = opts.extractRuns ?? 2
   const judges = opts.judges ?? 3
-  let extractor = `distiller v0.1 / ${deps.llm.describe()}`
-  if (judges > 0) extractor += ` judges:${judges}`
+  // No " judges:N" suffix here — the run-level judge count is documented as env
+  // configuration (README/LLM_WIKI); per-candidate judge provenance (whether THIS
+  // candidate was actually judged, its median, and voting turnout) is recorded on the
+  // entry itself via Candidate.judgeNote below, since a run-level label can't distinguish
+  // a judged candidate from a secret quarantined without ever reaching JUDGE.
+  const extractor = `distiller v0.1 / ${deps.llm.describe()}`
   const summary: RunSummary = {
     scanned: 0, eligible: 0, skippedProcessed: 0, triagedOut: 0,
     triagedLlm: 0, triagedHeuristic: 0, poolRaw: 0,
@@ -191,7 +195,10 @@ export async function runPipeline(
       // threshold in validateCandidates (below-threshold candidates are simply never
       // counted, not rejected-with-reason).
       let toReconcile = pooled.candidates
-      if (judges > 0) {
+      // judges <= 1 disables judging entirely (judgeCandidate itself short-circuits with
+      // panel: 0 — see judge.ts); gating the loop the same way here just skips the
+      // pointless per-candidate call, it isn't required for correctness.
+      if (judges > 1) {
         const kept: Candidate[] = []
         for (const c of pooled.candidates) {
           const verdict = await judgeCandidate(c, deps.llm, judges)
@@ -199,7 +206,14 @@ export async function runPipeline(
             `distiller: ${meta.sessionId}: judge: ${c.title} self:${verdict.selfScore} median:${verdict.salience} panel:${verdict.voted}/${verdict.panel}`,
           )
           if (verdict.salience < salienceMin) continue
-          kept.push({ ...c, salience: verdict.salience })
+          // Per-candidate judge provenance recorded on the entry itself (see
+          // reconcile.ts's entryFromCandidate/applyUpdate), not a run-level label — a
+          // fallback (all judges abstained) gets its own wording since voted is always 0
+          // there and "median" would be misleading (there was no consensus to take).
+          const judgeNote = verdict.usedFallback
+            ? `judged: fallback self-score ${verdict.selfScore} (0/${verdict.panel})`
+            : `judged: median ${verdict.salience} (${verdict.voted}/${verdict.panel})`
+          kept.push({ ...c, salience: verdict.salience, judgeNote })
         }
         toReconcile = kept
       }

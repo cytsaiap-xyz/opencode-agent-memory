@@ -63,6 +63,10 @@ export interface ReconcileDeps {
 
 function entryFromCandidate(c: Candidate, meta: TranscriptMeta, deps: ReconcileDeps): MemoryEntry {
   const nowIso = deps.now.toISOString()
+  // Per-entry judge provenance (spec: judges: k/N median m), dated like every other note
+  // on this entry — only present when the candidate actually went through JUDGE.
+  const notes: string[] = []
+  if (c.judgeNote) notes.push(`${nowIso.slice(0, 10)}: ${c.judgeNote}`)
   return {
     id: entryId(meta.project, c.title, deps.now),
     memory_class: c.type === "workflow" ? "procedural" : "semantic",
@@ -83,7 +87,7 @@ function entryFromCandidate(c: Candidate, meta: TranscriptMeta, deps: ReconcileD
     created_at: nowIso,
     updated_at: nowIso,
     lesson: c.lesson,
-    notes: [],
+    notes,
   }
 }
 
@@ -104,6 +108,7 @@ async function applyUpdate(
   if (!target.evidence.some((ev) => ev.session === meta.sessionId)) {
     target.evidence.push({ session: meta.sessionId, anchors: c.evidence.map((e) => e.message_id), observed_at: meta.timeEnd })
     target.notes.push(`${day}: ${note} (${meta.sessionId})`)
+    if (c.judgeNote) target.notes.push(`${day}: ${c.judgeNote}`)
   }
   if (target.project !== meta.project && target.scope === "project")
     target.notes.push(`${day}: promotion candidate: seen in ${meta.project}`)

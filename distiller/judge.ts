@@ -80,8 +80,10 @@ export async function judgeCandidate(
   llm: LlmClient,
   judges: number,
 ): Promise<JudgeVerdict> {
-  // Short-circuit for judges=0 or negative
-  if (judges <= 0) {
+  // Short-circuit for judges 0, 1, or negative — per spec, N=0 OR 1 disables judging
+  // (a single judge call adds LLM cost without any consensus benefit over the
+  // extractor's own self-score, so it's treated the same as "off").
+  if (judges <= 1) {
     return {
       salience: c.salience,
       panel: 0,

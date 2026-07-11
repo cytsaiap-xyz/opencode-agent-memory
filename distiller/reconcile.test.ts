@@ -75,6 +75,41 @@ test("no neighbors -> ADD without any LLM call", async () => {
   expect(onDisk.id).toBe(r.entry!.id)
 })
 
+test("ADD path: candidate.judgeNote is appended to the new entry's notes, dated like other notes", async () => {
+  const { storeDir, index } = await setup()
+  let called = 0
+  const llm: LlmClient = { describe: () => "f", complete: async () => { called++; return '{"op":"ADD"}' } }
+  const r = await reconcileCandidate(
+    cand({ judgeNote: "judged: median 8 (3/3)" }), meta,
+    deps({ llm, index, storeDir }),
+  )
+  expect(r.op).toBe("ADD")
+  expect(called).toBe(0)
+  expect(r.entry!.notes.some((n) => n.includes("judged: median 8 (3/3)"))).toBe(true)
+  // Dated like every other note on the entry.
+  expect(r.entry!.notes.some((n) => n.startsWith("2026-07-11: judged:"))).toBe(true)
+})
+
+test("ADD path: no judgeNote on the candidate -> no note on the new entry (judges=0/1 case)", async () => {
+  const { storeDir, index } = await setup()
+  const llm: LlmClient = { describe: () => "f", complete: async () => '{"op":"ADD"}' }
+  const r = await reconcileCandidate(cand(), meta, deps({ llm, index, storeDir }))
+  expect(r.op).toBe("ADD")
+  expect(r.entry!.notes.length).toBe(0)
+})
+
+test("UPDATE path: candidate.judgeNote is appended alongside the reconcile note", async () => {
+  const seed = existing("mem_20260710_aaaaaa")
+  const { storeDir, index } = await setup(seed)
+  const r = await reconcileCandidate(
+    cand({ judgeNote: "judged: fallback self-score 7 (0/3)" }), meta,
+    deps({ llm: fakeLlm('{"op":"UPDATE","target_id":"mem_20260710_aaaaaa","note":"confirmed again"}'), index, storeDir }),
+  )
+  expect(r.op).toBe("UPDATE")
+  expect(r.entry!.notes.some((n) => n.includes("confirmed again"))).toBe(true)
+  expect(r.entry!.notes.some((n) => n.includes("judged: fallback self-score 7 (0/3)"))).toBe(true)
+})
+
 test("UPDATE appends evidence + note and raises confidence", async () => {
   const seed = existing("mem_20260710_aaaaaa")
   const { storeDir, index } = await setup(seed)
