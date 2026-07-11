@@ -165,7 +165,7 @@ async function addEntry(
 // memory don't each spawn their own quarantine file — the human reviews one proposal, not
 // a pile of duplicates. Tolerant of unreadable/unparseable files (best-effort dedupe, never
 // fatal) and of a missing quarantine/ directory (nothing pending yet).
-function findExistingPending(storeDir: string, targetId: string): MemoryEntry | null {
+export function findExistingPending(storeDir: string, targetId: string): MemoryEntry | null {
   const quarantineDir = join(storeDir, "quarantine")
   let files: string[] = []
   try {
@@ -209,6 +209,54 @@ async function interceptPending(
   return { op: "SUPERSEDE_PENDING", entry }
 }
 
+// Shared "supersede target -> byId" mechanics, factored out so distiller/reflect.ts's MERGE
+// op (absorb -> keep, where keep already exists) can ride the exact same policy governance
+// as reconcile's SUPERSEDE (candidate -> new entry). Given only a target entry and the *id*
+// of whatever now supersedes it, applies the same two-way split the inline SUPERSEDE code
+// below used to do: decision/convention targets are deliberate human calls, so instead of
+// auto-mutating them, the entry that supersedes them (byId, looked up fresh via the index) is
+// cloned as a quarantined proposal — supersedes: target.id, routed through the existing
+// review queue via writeQuarantineEntry (which uniquifies the id, since byId's own row is
+// still occupying that id) — exactly like reconcile's interceptPending does for its candidate
+// case, and dedupes against an already-pending proposal via findExistingPending. Anything
+// else is tombstoned in place, pointing at byId — reconcile's non-policy SUPERSEDE branch
+// only ever reaches this half (the policy branch is intercepted upstream, before a byId even
+// exists), so its output stays byte-identical to before this extraction.
+export async function applySupersession(
+  target: MemoryEntry,
+  byId: string,
+  reason: string,
+  deps: { storeDir: string; index: MemoryQuery; now: Date },
+): Promise<{ op: "SUPERSEDE" | "SUPERSEDE_PENDING"; entry: MemoryEntry }> {
+  const dateStr = deps.now.toISOString().slice(0, 10)
+  if (target.type === "decision" || target.type === "convention") {
+    const existing = findExistingPending(deps.storeDir, target.id)
+    if (existing) return { op: "SUPERSEDE_PENDING", entry: existing }
+    const byHit = deps.index.getById(byId)
+    const base = byHit ? byHit.entry : target
+    const pending: MemoryEntry = {
+      ...base,
+      status: "quarantined",
+      review: "human_pending",
+      supersedes: target.id,
+      updated_at: deps.now.toISOString(),
+      notes: [...base.notes, `${dateStr}: pending review — proposes to merge ${target.id} into ${byId}: ${reason}`],
+    }
+    const entry = await writeQuarantineEntry(deps.storeDir, deps.index, pending)
+    return { op: "SUPERSEDE_PENDING", entry }
+  }
+  const updated: MemoryEntry = {
+    ...target,
+    status: "superseded",
+    superseded_by: byId,
+    updated_at: deps.now.toISOString(),
+    notes: [...target.notes, `${dateStr}: superseded by ${byId} — ${reason}`],
+  }
+  const path = await writeEntry(deps.storeDir, updated)
+  deps.index.upsertEntry(updated, path)
+  return { op: "SUPERSEDE", entry: updated }
+}
+
 export async function reconcileCandidate(
   c: Candidate, meta: TranscriptMeta, deps: ReconcileDeps,
 ): Promise<{ op: ReconcileOp["op"] | "SUPERSEDE_PENDING"; entry?: MemoryEntry }> {
@@ -250,13 +298,10 @@ export async function reconcileCandidate(
       // neighbors): nothing new was created, so there is nothing to tombstone.
       if (added.op === "UPDATE") return added
       const entry = added.entry
-      const old = target.entry
-      old.status = "superseded"
-      old.superseded_by = entry.id
-      old.notes.push(`${deps.now.toISOString().slice(0, 10)}: superseded by ${entry.id} — ${decision.reason}`)
-      old.updated_at = deps.now.toISOString()
-      const oldPath = await writeEntry(deps.storeDir, old)
-      deps.index.upsertEntry(old, oldPath)
+      // target.entry.type is guaranteed non-policy here (the decision/convention branch
+      // above already returned via interceptPending), so applySupersession always takes
+      // its direct-tombstone path — byte-identical to the inline code this replaced.
+      await applySupersession(target.entry, entry.id, decision.reason, { storeDir: deps.storeDir, index: deps.index, now: deps.now })
       return { op: "SUPERSEDE", entry }
     }
     case "NOOP":

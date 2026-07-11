@@ -97,6 +97,25 @@ export async function approveEntry(
     }
   }
 
+  // Step 4: reciprocal note on the promotion source, if any — best-effort, exactly like the
+  // supersedes-target-missing case above: a source that has drifted out of the index never
+  // blocks the approval, it only downgrades to a warning.
+  if (entry.promoted_from) {
+    const sourceHit = index.getById(entry.promoted_from)
+    if (sourceHit) {
+      const source: MemoryEntry = {
+        ...sourceHit.entry,
+        updated_at: now.toISOString(),
+        notes: [...sourceHit.entry.notes, `${dateStr}: promoted to ${entry.id}`],
+      }
+      await Bun.write(sourceHit.path, serializeEntry(source))
+      index.upsertEntry(source, sourceHit.path)
+    } else {
+      const w = `promoted_from source ${entry.promoted_from} not found — approved without reciprocal note`
+      warning = warning ? `${warning}; ${w}` : w
+    }
+  }
+
   return { entry, movedTo, supersededTarget, warning }
 }
 

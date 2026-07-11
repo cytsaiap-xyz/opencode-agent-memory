@@ -147,6 +147,39 @@ test("reject archives the entry in place with a dated reason note", async () => 
   expect(hits.some((h) => h.entry.id === id)).toBe(false)
 })
 
+test("approve with promoted_from adds a reciprocal 'promoted to' note on the source entry", async () => {
+  const { storeDir, index } = setup()
+  const sourceId = "mem_20260711_source1"
+  seedActive(storeDir, index, entry(sourceId, {
+    type: "know_how", status: "active", review: "auto", project: "proja", title: "Source Lesson",
+  }))
+
+  const id = "mem_20260711_promo01"
+  seedQuarantined(storeDir, index, entry(id, {
+    project: "global", scope: "global", promoted_from: sourceId, title: "Promoted Copy",
+  }))
+
+  const result = await approveEntry(storeDir, index, id, now)
+
+  expect(result.entry.status).toBe("active")
+  expect(result.warning).toBeUndefined()
+
+  const sourceHit = index.getById(sourceId)!
+  expect(sourceHit.entry.notes.some((n) => n.includes(`promoted to ${result.entry.id}`))).toBe(true)
+})
+
+test("approve with missing promoted_from source sets a warning and does not throw", async () => {
+  const { storeDir, index } = setup()
+  const id = "mem_20260711_promo02"
+  seedQuarantined(storeDir, index, entry(id, { promoted_from: "mem_does_not_exist_src" }))
+
+  const result = await approveEntry(storeDir, index, id, now)
+
+  expect(result.entry.status).toBe("active")
+  expect(result.warning).toMatch(/mem_does_not_exist_src/)
+  expect(result.warning).toMatch(/not found/)
+})
+
 test("guards: unknown id, approving an active entry, and rejecting twice all throw not-pending/not-found", async () => {
   const { storeDir, index } = setup()
 
