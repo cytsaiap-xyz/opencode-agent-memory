@@ -5,11 +5,13 @@ import { probeSqlite } from "../shared/sqliteProbe"
 import { clientFromEnv, type LlmClient } from "./llm"
 import { openMemoryIndex, type MemoryQuery } from "./indexes"
 import { runPipeline } from "./pipeline"
+import { runReflect } from "./reflect"
 import { approveEntry, rejectEntry } from "./reviewops"
 
 export interface CliDeps { llm?: LlmClient; out?: (line: string) => void; err?: (line: string) => void }
 
-const USAGE = "usage: distiller <run [--project <slug>] | reindex | review | approve <id> | reject <id> [--reason <text>] | stats>"
+const USAGE =
+  "usage: distiller <run [--project <slug>] | reflect [--project <slug>] [--dry-run] | reindex | review | approve <id> | reject <id> [--reason <text>] | stats>"
 
 async function openIndex(
   cfg: { storeDir: string },
@@ -71,6 +73,41 @@ export async function runCli(
               `${s.ops.nooped} nooped, ${s.quarantined} quarantined, ${s.rejected} rejected, ${s.errors} errors ` +
               `(scanned ${s.scanned}, eligible ${s.eligible}, already-done ${s.skippedProcessed}, triaged ${s.triagedOut}, ` +
               `pool ${s.poolRaw}->${s.candidates}, triaged llm:${s.triagedLlm}/heur:${s.triagedHeuristic})`,
+          )
+          return s.errors > 0 ? 2 : 0
+        } finally {
+          index.close()
+        }
+      }
+      case "reflect": {
+        const salienceMin = numEnv(env, "AGENT_MEMORY_SALIENCE_MIN", 6, (n) => n >= 0 && n <= 10)
+        const judges = numEnv(env, "AGENT_MEMORY_JUDGES", 3, (n) => Number.isInteger(n) && n >= 0 && n <= 5)
+        let project: string | undefined
+        let dryRun = false
+        for (let i = 0; i < rest.length; i++) {
+          const flag = rest[i]
+          if (flag === "--project") {
+            project = rest[i + 1]
+            if (!project) throw new Error("--project needs a value")
+            i++
+          } else if (flag === "--dry-run") {
+            dryRun = true
+          } else {
+            throw new Error(`reflect: unknown flag "${flag}"`)
+          }
+        }
+        const llm = deps.llm ?? clientFromEnv(env)
+        mkdirSync(cfg.storeDir, { recursive: true })
+        const index = await openIndex(cfg, env, err)
+        try {
+          const s = await runReflect(
+            cfg,
+            { index, storeDir: cfg.storeDir, llm, judges, salienceMin, now: new Date(), dryRun, log: out },
+            { project },
+          )
+          out(
+            `reflect done: ${s.insights} insights, ${s.merges} merges (${s.mergesPending} pending review), ` +
+              `${s.promotions} promotions queued, ${s.clusters} clusters examined, ${s.skipped} skipped, ${s.errors} errors`,
           )
           return s.errors > 0 ? 2 : 0
         } finally {

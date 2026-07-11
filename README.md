@@ -21,7 +21,7 @@ design.
 ## Quick start (one command)
 
 ```bash
-./scripts/setup.sh --backfill --schedule "0 3 * * *"
+./scripts/setup.sh --backfill --schedule "0 3 * * *" --schedule-reflect "0 4 * * 0"
 ```
 
 Idempotent one-shot setup: installs the collector plugin globally, registers
@@ -29,8 +29,11 @@ the MCP server in `~/.config/opencode/opencode.json` (merge — existing config
 is never clobbered; invalid JSON aborts), exports all historical sessions,
 and installs a nightly `distill run` cron entry via `scripts/run-distill.sh`
 (logs to `~/.agent-memory/distill.log`, resolves bun without relying on
-cron's PATH). Both flags are optional; re-running is always safe. Restart
-opencode afterwards.
+cron's PATH), plus an independently-scheduled `distill reflect` cron entry
+(`scripts/run-distill.sh --reflect-only`, same log file) if
+`--schedule-reflect` is given — see "Reflect" below. All flags are optional;
+re-running is always safe (each cron marker is replaced in place, never
+duplicated). Restart opencode afterwards.
 
 macOS note: cron may need Full Disk Access if the repo lives under
 Documents/Desktop (TCC). On servers, a systemd timer calling
@@ -289,6 +292,7 @@ volume.
 
 ```bash
 bun run distill run [--project <slug>]   # run the pipeline once
+bun run distill reflect [--project <slug>] [--dry-run]  # cross-session consolidation (see Reflect below)
 bun run distill reindex                  # rebuild index.db from memories/ on disk
 bun run distill review                   # list ALL entries pending human review
 bun run distill approve <id>             # release a pending entry (see Review workflow below)
@@ -373,6 +377,120 @@ Had this been `approve`d instead, `mem_20260710_8cd55e` would be tombstoned
 entry would become the active answer. The other four memory types
 (`root_cause`, `pitfall`, `know_how`, `workflow`) are factual, not policy —
 their SUPERSEDEs still apply automatically, with no review step.
+
+### Reflect (cross-session consolidation)
+
+`distill run` distills one transcript at a time. `distill reflect` looks
+*across* the whole store afterwards, finding patterns and duplication no
+single-session run could see:
+
+```bash
+bun run distill reflect --dry-run          # ALWAYS run this first — see SOP below
+bun run distill reflect [--project <slug>]
+```
+
+**What it does — deterministic clustering, then a judge-gated LLM call per
+cluster.** Active entries are grouped by shared domain tag, then a pairwise
+token-Jaccard similarity over `title + trigger` (threshold `0.35`, reused
+from `pool.ts`'s dedup logic) groups similar members into connected
+components (union-find). Clusters below size 2 are dropped; clusters above
+size 12 keep only the highest-confidence members. Each cluster is then shown
+to the LLM, which must pick exactly ONE of three operations:
+
+1. **`insight`** — the cluster reveals a genuinely higher-order pattern no
+   single member already states. Creates a new `semantic` memory entry
+   (`review: auto`, so it must clear the same judge gate — median salience
+   ≥ `AGENT_MEMORY_SALIENCE_MIN` — as any freshly-extracted candidate) with
+   a `derived from: <sorted member ids>` note and the union of the members'
+   evidence (deduped by session).
+2. **`merge`** — two or more members say the SAME thing in different words
+   (a write-time RECONCILE near-duplicate that slipped through). The absorbed
+   members are tombstoned into the kept entry exactly like a normal
+   SUPERSEDE — including the **same policy gate**: if the kept entry (or an
+   absorbed one) is `decision`/`convention` type, the merge is NOT applied
+   directly; it's written to the review queue as a `SUPERSEDE_PENDING`
+   proposal instead (`distill review` / `approve` / `reject`, same as the
+   worked example above).
+3. **`none`** — the cluster is thematic coincidence only; no-op.
+
+After the cluster pass, reflect also runs a **promotion scan**: any active,
+project-scoped entry whose evidence spans ≥ 2 distinct projects (or that
+already carries a `"promotion candidate"` note from RECONCILE) gets a
+`global`-scope pending copy queued for human review (`status: quarantined`,
+`review: human_pending`, `promoted_from: <source id>`) — the same
+`distill review` / `approve` / `reject` flow handles it. **Approving** a
+promoted entry appends a reciprocal `promoted to <final id>` note back onto
+the original project-scoped source entry (missing source → a warning, never
+a hard failure).
+
+> **Caveat:** the "≥ 2 distinct projects" half of the promotion signal is
+> resolved by cross-referencing each evidence session id against the live
+> transcript spool (`cfg.transcriptsDir`) — it has no independent memory of
+> which project a session belonged to. If a retention job prunes old
+> transcripts, that signal silently degrades toward 0 for older evidence
+> (the `"promotion candidate"` note signal RECONCILE already leaves is
+> unaffected and remains the durable fallback — either signal alone is
+> enough to trigger promotion).
+
+**Governance inheritance — reflect adds no new governance rules.** Every
+mutation reflect makes rides EXISTING machinery: insights are judged exactly
+like extraction candidates; merges apply the same supersession code path as
+RECONCILE (so the decision/convention pending-review gate is inherited for
+free); promotions create pending quarantine copies exactly like a secret-scan
+hit. There is nothing reflect can do that skips the review queue that
+extraction/reconcile couldn't already do.
+
+**Statelessness — reflect is safe to run as often as you like.** It carries
+no state of its own between runs; idempotency is entirely derived from what's
+already on disk: a re-formed cluster is skipped if an active entry's notes
+already carry its exact `derived from: <ids>` tag; a merge is skipped once
+its absorbed members are gone (or, for a policy-routed merge, once a pending
+proposal already exists for every absorbed id); a promotion is skipped once
+any non-archived entry already carries `promoted_from: <source id>`.
+Immediately re-running `distill reflect` after a full run should always
+report everything as skipped, with zero new files.
+
+**Dry-run-first SOP.** `--dry-run` computes and logs every planned op
+(cluster ops still call the LLM — dry-run only skips the *write*) but makes
+**zero writes** to the store. Always run `--dry-run` first, read the printed
+plan, and only then run it for real:
+
+```bash
+bun run distill reflect --dry-run   # inspect the plan; store is untouched
+bun run distill reflect             # apply it
+bun run distill review              # anything queued for human review?
+```
+
+`reflect` prints a one-line summary, e.g.:
+
+```
+reflect done: 2 insights, 1 merges (1 pending review), 1 promotions queued, 5 clusters examined, 3 skipped, 0 errors
+```
+
+Exit codes: `0` success, `1` bad usage/config (unknown flag, missing
+`--project` value, invalid env value), `2` one or more clusters errored (a
+malformed LLM response) — the rest of the run still completes.
+
+**Scheduling.** Reflect is meant to run less often than the nightly distill
+(it consolidates across sessions that are already distilled, so there's no
+benefit to running it every time new transcripts land) — schedule it
+independently:
+
+```bash
+./scripts/setup.sh --schedule-reflect "0 4 * * 0"   # weekly, Sunday 04:00
+```
+
+or run both from a single cron line via `run-distill.sh --with-reflect`
+(runs `distill run` then `distill reflect`, same log, exit code = the worse
+of the two):
+
+```bash
+0 3 * * * /path/to/opencode-agent-memory/scripts/run-distill.sh --with-reflect
+```
+
+`AGENT_MEMORY_JUDGES` and `AGENT_MEMORY_SALIENCE_MIN` (see Configuration
+below) are shared with `distill run` — reflect reuses them rather than
+introducing its own knobs.
 
 ### Configuration
 
@@ -471,6 +589,15 @@ The distiller does not schedule itself — run it externally:
 <key>StartCalendarInterval</key>
 <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>
 ```
+
+`scripts/run-distill.sh` (the cron-safe wrapper `setup.sh --schedule`
+installs) also understands two mode flags for reflect: `--with-reflect` runs
+`distill run` then `distill reflect` back-to-back into the same log (exit
+code = the worse of the two); `--reflect-only` runs ONLY `distill reflect` —
+this is what `setup.sh --schedule-reflect "<cron>"` installs as a second,
+independently-scheduled `# agent-memory-reflect`-marked cron line (see
+"Reflect" above). Any trailing args (e.g. `--project <slug>`) are forwarded
+to whichever distill command(s) run.
 
 ### opencode-run vs vLLM
 
@@ -856,12 +983,15 @@ shared/     config loading, project slugs, default DB path (shared with distille
 collector/  db.ts (read-only bundle load), transcript.ts (render), export.ts (skip/write rules),
             plugin.ts (session.idle hook), plugin-entry.ts (bundle entrypoint — exports only
             the plugin, per the opencode loader's function-exports-only contract), backfill.ts (CLI)
-distiller/  cli.ts (run/reindex/review/approve/reject/stats), pipeline.ts (stage orchestration),
-            transcripts.ts (spool scan/parse), extract.ts (prompt + validation), triage.ts
-            (LLM pre-filter gate, fail-open), pool.ts (deterministic self-consistency dedup/merge),
-            judge.ts (multi-judge median salience consensus), reconcile.ts (Mem0-style
-            ADD/UPDATE/SUPERSEDE/NOOP, decision/convention SUPERSEDE interception),
-            reviewops.ts (approveEntry/rejectEntry — the human review loop), quarantine.ts
+distiller/  cli.ts (run/reflect/reindex/review/approve/reject/stats), pipeline.ts (stage
+            orchestration), transcripts.ts (spool scan/parse), extract.ts (prompt + validation),
+            triage.ts (LLM pre-filter gate, fail-open), pool.ts (deterministic self-consistency
+            dedup/merge), judge.ts (multi-judge median salience consensus), reconcile.ts
+            (Mem0-style ADD/UPDATE/SUPERSEDE/NOOP, decision/convention SUPERSEDE interception,
+            applySupersession/findExistingPending shared with reflect), cluster.ts (deterministic
+            domain+similarity clustering for reflect), reflect.ts (cross-session insight/merge/
+            promotion ops, see README "Reflect" section), reviewops.ts (approveEntry/rejectEntry
+            — the human review loop, incl. promoted_from reciprocal note), quarantine.ts
             (shared uniquified quarantine writer), store.ts (markdown entry read/write), ledger.ts
             (sqlite index + idempotency + trigram FTS), llm.ts (vllm / opencode-run clients)
 mcp-server/ query.ts (search/rank + get/list/stats over MemoryIndex), server.ts (buildServer():
@@ -880,9 +1010,12 @@ architecture, `docs/superpowers/specs/2026-07-11-regression-eval-design.md`
 for the eval harness design,
 `docs/superpowers/specs/2026-07-11-sqlite-optional-design.md` for the
 sqlite-optional design, `docs/superpowers/specs/2026-07-11-quality-pack-design.md`
-for the extraction quality pack design, `docs/superpowers/VERIFY.md` for the
+for the extraction quality pack design,
+`docs/superpowers/specs/2026-07-11-reflect-design.md` for the reflect design,
+`docs/superpowers/VERIFY.md` for the
 collector's manual verification checklist, `docs/superpowers/VERIFY-distiller.md`
 for the distiller's, `docs/superpowers/VERIFY-mcp.md` for the mcp-server's,
 `docs/superpowers/VERIFY-eval.md` for the eval harness's,
 `docs/superpowers/VERIFY-sqlite-optional.md` for the sqlite-optional mode's,
-and `docs/superpowers/VERIFY-quality-pack.md` for the quality pack's.
+`docs/superpowers/VERIFY-quality-pack.md` for the quality pack's, and
+`docs/superpowers/VERIFY-reflect.md` for reflect's.
