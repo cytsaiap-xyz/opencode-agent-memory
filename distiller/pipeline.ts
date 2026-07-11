@@ -2,7 +2,7 @@ import { mkdir } from "node:fs/promises"
 import { readdirSync } from "node:fs"
 import { join } from "node:path"
 import type { MemoryConfig } from "../shared/config"
-import { buildExtractPrompt, EXTRACT_SCHEMA, validateCandidates, type Candidate } from "./extract"
+import { buildExtractPrompt, extractFromTranscript, type Candidate } from "./extract"
 import type { LlmClient } from "./llm"
 import type { MemoryIndex } from "./ledger"
 import { writeQuarantineEntry } from "./quarantine"
@@ -73,9 +73,10 @@ export async function runPipeline(
         continue
       }
 
-      const { system, prompt, promptHash } = buildExtractPrompt(meta)
-      const raw = await deps.llm.complete({ system: `${system}\n\nSalience threshold: ${salienceMin}.`, prompt, schema: EXTRACT_SCHEMA })
-      const validated = validateCandidates(raw, meta, salienceMin)
+      // promptHash is a pure hash of the fixed SYSTEM template (not the transcript), so
+      // this cheap call is independent of extractFromTranscript's actual LLM request.
+      const { promptHash } = buildExtractPrompt(meta)
+      const validated = await extractFromTranscript(meta, deps.llm, salienceMin)
       summary.candidates += validated.valid.length + validated.secrets.length
       summary.rejected += validated.rejected.length
       for (const rej of validated.rejected)

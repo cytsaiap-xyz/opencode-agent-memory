@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import type { LlmClient } from "./llm"
 import { anchorsIn, type TranscriptMeta } from "./transcripts"
 import type { MemoryType } from "./types"
 
@@ -147,4 +148,23 @@ export function validateCandidates(raw: string, meta: TranscriptMeta, salienceMi
     else result.valid.push(candidate)
   }
   return result
+}
+
+// Shared drift seam: the prompt-build + complete + validate sequence used to be
+// duplicated independently in distiller/pipeline.ts and eval/run.ts. Both call sites
+// now go through this single function so the eval can never silently diverge from
+// what the real pipeline actually sends the LLM (request shape, salience threshold
+// wording, validation rules).
+export async function extractFromTranscript(
+  meta: TranscriptMeta,
+  llm: LlmClient,
+  salienceMin: number,
+): Promise<ValidationResult> {
+  const { system, prompt } = buildExtractPrompt(meta)
+  const raw = await llm.complete({
+    system: `${system}\n\nSalience threshold: ${salienceMin}.`,
+    prompt,
+    schema: EXTRACT_SCHEMA,
+  })
+  return validateCandidates(raw, meta, salienceMin)
 }

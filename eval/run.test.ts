@@ -238,6 +238,31 @@ describe("runEval", () => {
     expect(summary.retrieval!.total).toBe(1)
   })
 
+  it("mode retrieval does not append to results.jsonl even with resultsPath set (not a model eval)", async () => {
+    const evalDir = setupEvalDir(tmpDir)
+    const llm = new FakeLlm()
+    const resultsPath = join(tmpDir, "results.jsonl")
+
+    const summary = await runEval({
+      evalDir,
+      llm,
+      resultsPath,
+      mode: "retrieval",
+    })
+
+    expect(summary.retrieval).toBeDefined()
+    expect(summary.retrieval!.pass).toBe(1)
+
+    // File should not exist — a retrieval smoke run has no model/extraction signal
+    // worth tracking in results.jsonl history.
+    try {
+      await Bun.file(resultsPath).text()
+      expect.unreachable("results.jsonl should not have been written")
+    } catch {
+      // Expected
+    }
+  })
+
   it("resultsPath null skips writing results", async () => {
     const evalDir = setupEvalDir(tmpDir)
     const llm = new FakeLlm()
@@ -258,6 +283,76 @@ describe("runEval", () => {
     } catch {
       // Expected
     }
+  })
+
+  it("scorecard totals line is printed verbatim, not index/array-polluted (forEach(out) regression)", async () => {
+    const evalDir = setupEvalDir(tmpDir)
+    const llm = new FakeLlm()
+    const capturedLines: string[] = []
+
+    const summary = await runEval({
+      evalDir,
+      llm,
+      out: (line) => capturedLines.push(line),
+      resultsPath: null,
+    })
+
+    expect(summary.pass).toBe(true)
+    // Passing `out` directly as a callback (e.g. console.log) previously received
+    // (value, index, array) from Array.prototype.forEach and printed the index/array
+    // as extra arguments. Assert the totals line is EXACTLY the expected string, with
+    // no trailing index or array garbage appended.
+    const extractionTotals = capturedLines.find((l) => l.startsWith("Extraction:"))
+    expect(extractionTotals).toBe(
+      "Extraction: 1/1 fixtures passed, 1/1 expectations met, 0 forbidden hits, 0 extras, 0 errors",
+    )
+    const retrievalTotals = capturedLines.find((l) => l.startsWith("Retrieval:"))
+    expect(retrievalTotals).toBe("Retrieval: 1/1 queries passed")
+  })
+
+  it("throws a descriptive error when a case has an empty-keywords expect/forbid rule (fail fast, not match-everything)", async () => {
+    // Mini eval dir: only what runExtraction needs (fixtures + cases.json), no retrieval
+    // setup, since mode: "extraction" never touches the retrieval directory.
+    const evalDir = join(tmpDir, "empty-keywords-eval")
+    mkdirSync(join(evalDir, "fixtures"), { recursive: true })
+    writeFileSync(join(evalDir, "fixtures", "test.md"), createTranscript("ses_empty_kw_001"))
+    writeFileSync(
+      join(evalDir, "cases.json"),
+      JSON.stringify([
+        {
+          fixture: "test.md",
+          expect: [{ keywords: [] }],
+          forbid: [],
+        },
+      ]),
+    )
+
+    const llm = new FakeLlm()
+    await expect(runEval({ evalDir, llm, mode: "extraction", resultsPath: null })).rejects.toThrow(
+      /empty keywords array/i,
+    )
+    // Validation happens at load, before any fixture is processed — no LLM call made.
+    expect(llm.callCount).toBe(0)
+
+    // Same guard applies to forbid rules.
+    const evalDir2 = join(tmpDir, "empty-keywords-eval-forbid")
+    mkdirSync(join(evalDir2, "fixtures"), { recursive: true })
+    writeFileSync(join(evalDir2, "fixtures", "test.md"), createTranscript("ses_empty_kw_002"))
+    writeFileSync(
+      join(evalDir2, "cases.json"),
+      JSON.stringify([
+        {
+          fixture: "test.md",
+          expect: [{ keywords: ["decision"] }],
+          forbid: [{ keywords: [] }],
+        },
+      ]),
+    )
+    const llm2 = new FakeLlm()
+    await expect(runEval({ evalDir: evalDir2, llm: llm2, mode: "extraction", resultsPath: null })).rejects.toThrow(
+      /empty keywords array/i,
+    )
+    expect(llm2.callCount).toBe(0)
   })
 
   it("bad query id (expect_id not in store) fails retrieval", async () => {

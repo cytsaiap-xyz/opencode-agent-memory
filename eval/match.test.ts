@@ -59,6 +59,27 @@ describe("candidateMatches", () => {
     expect(candidateMatches(candidate, { keywords: ["decimal"] })).toBe(true)
   })
 
+  it("filters by a type SET when type is an array — matches any member", () => {
+    const candidate: Candidate = {
+      type: "decision",
+      title: "Use Decimal for Money",
+      trigger: "Handle currency",
+      lesson: "Never use float for money",
+      domain: ["coding"],
+      evidence: [{ message_id: "msg_3" }],
+      salience: 9,
+      volatile: false,
+    }
+
+    // array with a match (candidate.type "decision" is a member of the set)
+    expect(candidateMatches(candidate, { type: ["decision", "convention"], keywords: ["decimal"] })).toBe(true)
+    // array without a match (candidate.type "decision" is not a member of the set)
+    expect(candidateMatches(candidate, { type: ["pitfall", "root_cause"], keywords: ["decimal"] })).toBe(false)
+    // plain string behavior unchanged when type is a scalar
+    expect(candidateMatches(candidate, { type: "decision", keywords: ["decimal"] })).toBe(true)
+    expect(candidateMatches(candidate, { type: "pitfall", keywords: ["decimal"] })).toBe(false)
+  })
+
   it("searches across title, trigger, and lesson", () => {
     const candidate: Candidate = {
       type: "know_how",

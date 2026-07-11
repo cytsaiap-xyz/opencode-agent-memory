@@ -537,6 +537,9 @@ commit) a line when it represents a meaningful result you want in history
 (a baseline, or a deliberate model/prompt-change comparison). Throwaway
 verification runs while iterating don't need to be kept — the results.jsonl
 diff is a two-line comparison tool, not an audit log of every invocation.
+`--retrieval-only` never appends to `results.jsonl` regardless — a retrieval
+smoke check makes zero LLM calls and carries no model/prompt/threshold
+signal, so it isn't a model eval worth tracking in that history.
 
 ### `eval/cases.json` — extraction expectations
 

@@ -1,7 +1,7 @@
 import type { Candidate } from "../distiller/extract"
 
-export interface ExpectRule { type?: string; keywords: string[]; min?: number }
-export interface ForbidRule { type?: string; keywords: string[] }
+export interface ExpectRule { type?: string | string[]; keywords: string[]; min?: number }
+export interface ForbidRule { type?: string | string[]; keywords: string[] }
 export interface ExtractionCase {
   fixture: string; salience_min?: number
   expect: ExpectRule[]; forbid?: ForbidRule[]
@@ -16,8 +16,11 @@ export interface CaseScore {
   failures: string[]             // human-readable reasons
 }
 
-export function candidateMatches(c: Candidate, rule: { type?: string; keywords: string[] }): boolean {
-  if (rule.type && c.type !== rule.type) return false
+export function candidateMatches(c: Candidate, rule: { type?: string | string[]; keywords: string[] }): boolean {
+  if (rule.type) {
+    const typeMatches = Array.isArray(rule.type) ? rule.type.includes(c.type) : c.type === rule.type
+    if (!typeMatches) return false
+  }
 
   const text = `${c.title} ${c.trigger} ${c.lesson}`.toLowerCase()
   return rule.keywords.every(keyword => text.includes(keyword.toLowerCase()))
@@ -37,7 +40,7 @@ export function scoreCase(kase: ExtractionCase, candidates: Candidate[]): CaseSc
     if (matchCount >= minRequired) {
       expectationsMet++
     } else {
-      const typeStr = rule.type ? `type: ${rule.type}, ` : ""
+      const typeStr = rule.type ? `type: ${Array.isArray(rule.type) ? JSON.stringify(rule.type) : rule.type}, ` : ""
       failures.push(`expect[${i}] {${typeStr}keywords: ${JSON.stringify(rule.keywords)}} matched ${matchCount} < ${minRequired}`)
     }
   }

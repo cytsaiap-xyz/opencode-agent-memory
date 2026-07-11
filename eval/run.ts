@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { readFileSync, writeFileSync, appendFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { buildExtractPrompt, EXTRACT_SCHEMA, validateCandidates } from "../distiller/extract"
+import { extractFromTranscript } from "../distiller/extract"
 import type { LlmClient } from "../distiller/llm"
 import { clientFromEnv } from "../distiller/llm"
 import { MemoryIndex } from "../distiller/ledger"
@@ -36,6 +36,31 @@ export interface EvalRunSummary {
   }
 }
 
+// A rule with an empty keywords array is vacuously "match everything" (expect) or
+// "flag everything" (forbid) — see `Array.prototype.every` on `[]` — which silently
+// defeats the point of the assertion. Fail fast at load instead of letting a typo'd
+// case pass (or fail) for the wrong reason.
+function validateCases(cases: ExtractionCase[]): void {
+  for (const kase of cases) {
+    kase.expect.forEach((rule, i) => {
+      if (rule.keywords.length === 0)
+        throw new Error(
+          `eval/cases.json: fixture "${kase.fixture}" expect[${i}] has an empty keywords array — ` +
+            `this matches every candidate (of the given type, or of any type), defeating the ` +
+            `assertion. Add at least one real keyword.`,
+        )
+    })
+    for (const [i, rule] of (kase.forbid ?? []).entries()) {
+      if (rule.keywords.length === 0)
+        throw new Error(
+          `eval/cases.json: fixture "${kase.fixture}" forbid[${i}] has an empty keywords array — ` +
+            `this flags every candidate as forbidden, defeating the assertion. Add at least one ` +
+            `real keyword.`,
+        )
+    }
+  }
+}
+
 async function runExtraction(
   evalDir: string,
   llm: LlmClient,
@@ -52,6 +77,7 @@ async function runExtraction(
 }> {
   const casesPath = join(evalDir, "cases.json")
   const cases: ExtractionCase[] = JSON.parse(readFileSync(casesPath, "utf8"))
+  validateCases(cases)
   const fixturesDir = join(evalDir, "fixtures")
 
   let fixturesPass = 0
@@ -67,14 +93,8 @@ async function runExtraction(
       const content = readFileSync(fixturePath, "utf8")
       const meta = parseTranscript(fixturePath, content)
 
-      const { system, prompt } = buildExtractPrompt(meta)
       const salMin = kase.salience_min ?? salienceMin
-      const raw = await llm.complete({
-        system: `${system}\n\nSalience threshold: ${salMin}.`,
-        prompt,
-        schema: EXTRACT_SCHEMA,
-      })
-      const validated = validateCandidates(raw, meta, salMin)
+      const validated = await extractFromTranscript(meta, llm, salMin)
       const caseScore = scoreCase(kase, validated.valid)
 
       if (caseScore.status === "pass") fixturesPass++
@@ -191,10 +211,12 @@ export async function runEval(opts: EvalOptions): Promise<EvalRunSummary> {
   if (retrieval) {
     lines.push(`Retrieval: ${retrieval.pass}/${retrieval.total} queries passed`)
   }
-  lines.forEach(out)
+  lines.forEach((line) => out(line))
 
-  // Write results.jsonl
-  if (resultsPath !== null) {
+  // Write results.jsonl — a retrieval-only smoke run is not a model eval (no LLM
+  // involved, nothing that tracks model/prompt/threshold drift), so it never appends
+  // to the history file even when a resultsPath is supplied.
+  if (resultsPath !== null && mode !== "retrieval") {
     const result = {
       ts: now.toISOString(),
       model: llm.describe(),

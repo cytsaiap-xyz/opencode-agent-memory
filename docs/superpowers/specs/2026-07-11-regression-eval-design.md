@@ -120,6 +120,13 @@ policy), but the harness itself gets unit tests with a FakeLlm.
   — switching models becomes a two-line diff. Committed manually (the file is
   tracked, appends are left to the user to commit when meaningful).
 
+  **Amendment (post-implementation):** the shipped runner uses camelCase field
+  names throughout — `fixturesPass, fixturesTotal, expectationsMet,
+  expectationsTotal, forbiddenHits, extras, errors` — matching `EvalRunSummary`'s
+  TS interface and every line actually in `eval/results.jsonl`; the snake_case
+  above was pre-implementation sketch only. A `--retrieval-only` run also does
+  not append a line at all (no model/extraction signal to track).
+
 ## 6. Testing (of the harness itself)
 
 - Matcher/scoring: pure-function unit tests (type+keyword matching, min counts,
