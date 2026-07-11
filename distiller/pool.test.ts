@@ -94,6 +94,19 @@ test("titleJaccard: underscores and alphanumeric treated as token boundaries", (
   expect(score2).toBe(1)
 })
 
+test("titleJaccard: punctuation-only strings (degenerate case)", () => {
+  // Regression test: "!!!" and "@@@" both tokenize to empty sets
+  // but should NOT be considered identical/duplicates because they differ
+  const score = titleJaccard("!!!", "@@@")
+  expect(score).toBe(0) // different triggers, not duplicates
+})
+
+test("titleJaccard: identical punctuation-only strings", () => {
+  // Identical punctuation-only strings should still be 1
+  const score = titleJaccard("!!!", "!!!")
+  expect(score).toBe(1) // same trigger, duplicates
+})
+
 // ============ isDuplicate tests ============
 
 test("isDuplicate: different types never duplicate", () => {
@@ -155,6 +168,27 @@ test("mergeCandidates: keeps longer lesson", () => {
   const merged2 = mergeCandidates(long, short)
   expect(merged2.lesson).toBe(long.lesson)
   expect(merged2.title).toBe(long.title)
+})
+
+test("mergeCandidates: equal lesson lengths → first argument (pool member) wins", () => {
+  // Tie-break pinning: when lessons are equal length, first arg should win
+  const first = cand({
+    title: "First title",
+    trigger: "first trigger",
+    lesson: "Equal length.",
+    evidence: [{ message_id: "msg_1" }],
+  })
+  const second = cand({
+    title: "Second title",
+    trigger: "second trigger",
+    lesson: "Equal length.",
+    evidence: [{ message_id: "msg_2" }],
+  })
+
+  const merged = mergeCandidates(first, second)
+  expect(merged.title).toBe(first.title) // first wins
+  expect(merged.trigger).toBe(first.trigger) // first wins
+  expect(merged.lesson).toBe(first.lesson) // first wins (though content is same, it's first's)
 })
 
 test("mergeCandidates: unions evidence without duplicates", () => {

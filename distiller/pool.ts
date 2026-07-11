@@ -16,7 +16,10 @@ export function titleJaccard(a: string, b: string): number {
   const tokensA = new Set(tokenize(a))
   const tokensB = new Set(tokenize(b))
 
-  if (tokensA.size === 0 && tokensB.size === 0) return 1 // both empty
+  if (tokensA.size === 0 && tokensB.size === 0) {
+    // both empty: return 1 only if raw strings are identical (e.g., "!!!" === "!!!")
+    return a.trim() === b.trim() ? 1 : 0
+  }
   if (tokensA.size === 0 || tokensB.size === 0) return 0 // one empty, one not
 
   let intersection = 0
@@ -54,7 +57,6 @@ export function isDuplicate(a: Candidate, b: Candidate): boolean {
 export function mergeCandidates(a: Candidate, b: Candidate): Candidate {
   // Determine which has the longer lesson
   const keeper = a.lesson.length >= b.lesson.length ? a : b
-  const other = a.lesson.length >= b.lesson.length ? b : a
 
   // Union evidence by message_id, preserving first-occurrence order (a's order first, then b's new ones)
   const seenIds = new Set<string>()
