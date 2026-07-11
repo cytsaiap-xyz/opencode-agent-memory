@@ -2,7 +2,6 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { readFileSync, writeFileSync, appendFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import type { Candidate } from "../distiller/extract"
 import { buildExtractPrompt, EXTRACT_SCHEMA, validateCandidates } from "../distiller/extract"
 import type { LlmClient } from "../distiller/llm"
 import { clientFromEnv } from "../distiller/llm"
@@ -123,24 +122,28 @@ async function runRetrieval(
   try {
     const dbPath = join(tmpDir, "index.db")
     const index = new MemoryIndex(dbPath)
-    const storeDir = join(evalDir, "retrieval", "store")
-    await index.rebuildFrom(storeDir)
+    try {
+      const storeDir = join(evalDir, "retrieval", "store")
+      await index.rebuildFrom(storeDir)
 
-    const queriesPath = join(evalDir, "retrieval", "queries.json")
-    const queries: RetrievalQuery[] = JSON.parse(readFileSync(queriesPath, "utf8"))
+      const queriesPath = join(evalDir, "retrieval", "queries.json")
+      const queries: RetrievalQuery[] = JSON.parse(readFileSync(queriesPath, "utf8"))
 
-    let pass = 0
-    for (const q of queries) {
-      const results = searchMemory(index, { query: q.query })
-      const found = results.slice(0, q.within_top).some((r) => r.id === q.expect_id)
-      if (found) pass++
+      let pass = 0
+      for (const q of queries) {
+        const results = searchMemory(index, { query: q.query })
+        const found = results.slice(0, q.within_top).some((r) => r.id === q.expect_id)
+        if (found) pass++
 
-      const symbol = found ? "✓" : "✗"
-      out(`${symbol} query: "${q.query}" — expect_id: ${q.expect_id}`)
+        const symbol = found ? "✓" : "✗"
+        out(`${symbol} query: "${q.query}" — expect_id: ${q.expect_id}`)
+      }
+
+      return { pass, total: queries.length }
+    } finally {
+      // Ensure index is always closed, even if rebuildFrom, JSON parsing, or queries throw
+      index.close()
     }
-
-    index.close()
-    return { pass, total: queries.length }
   } finally {
     try {
       await rm(tmpDir, { recursive: true, force: true })
