@@ -26,7 +26,7 @@
 **Mem0**（~60.5k★，Apache-2.0，募資 $24M）
 - **怎麼做**：兩階段管線——(1) LLM 從對話抽取原子化事實；(2) 每條事實 embedding 後跟既有記憶比對，第二個 LLM call 決定 ADD / UPDATE / DELETE / NOOP。向量庫（Qdrant 等 20+ 後端）儲存。曾有 graph 變體（Mem0ᵍ）。
 - **優點**：最成熟的「抽取→調和」迴圈（本報告自建系統的 RECONCILE 階段直接借用此設計）；TS/Python 雙 SDK；vLLM 支援一流。
-- **缺點**：**2026/04 的 OSS v3 把 graph memory 與 UPDATE/DELETE 整合從開源版移除、改為付費版限定**——開源版只剩 ADD-only，工程知識最需要的「新修法取代舊 workaround」正好做不到。抽取形狀是個人助理型（「使用者喜歡 X」），把工程知識的「為什麼」推理鏈打碎丟掉。官方 benchmark 與 Zep 互噴、雙方都能把對方重現到低 10-25 分，可信度存疑。
+- **缺點**：**2026/04 的 v3 把 graph memory 從開源版移除（Neo4j/Memgraph/Kuzu/Apache AGE/Neptune 全刪，PR #4805），並把自動 UPDATE/DELETE 整合「全面退役」——開源版與付費平台雙雙改為單趟 ADD-only**（2026-07-13 原始碼查證修正：原報告寫「改為付費版限定」是錯的，付費版同樣沒有保留自動整合；手動 update/delete API 兩邊都還在）。結果不變：工程知識最需要的「新修法自動取代舊 workaround」在 Mem0 生態裡已經不存在。抽取形狀是個人助理型（「使用者喜歡 X」），把工程知識的「為什麼」推理鏈打碎丟掉。官方 benchmark 與 Zep 互噴、雙方都能把對方重現到低 10-25 分，可信度存疑。
 
 **Letta（原 MemGPT）**（23.7k★，Apache-2.0）
 - **怎麼做**（classic）：self-editing memory blocks（常駐 context 的人格/事實區塊）+ recall memory（全歷史）+ archival memory（pgvector 段落）+ sleep-time compute（背景 agent 在閒置時整理記憶）。2026 年新旗艦 **MemFS**：記憶改為 **git-backed markdown 檔案庫**，「dream」子 agent 批次回顧 session、把教訓寫進記憶檔。
@@ -77,7 +77,7 @@
 四個決定性理由，按權重排序：
 
 **理由一：現成平台的 OSS 趨勢在劣化，而這是一個要活很多年的 on-prem 系統。**
-2025-2026 一年內：Mem0 把工程記憶最需要的功能（UPDATE/DELETE 整合、graph）從開源版抽走；Zep CE 凍結；Letta 自架 server 棄維護。押注任何一家，等於把系統核心綁在會抽走功能或棄坑的供應商上——對「資料不出廠、要長期自主維運」的環境是不可接受的尾部風險。
+2025-2026 一年內：Mem0 把 graph 從開源版刪除、並把招牌的自動 UPDATE/DELETE 整合迴圈整個產品線退役（開源與付費皆然——2026-07-13 查證修正）；Zep CE 凍結；Letta 自架 server 棄維護。押注任何一家，等於把系統核心綁在會抽走功能或棄坑的供應商上——對「資料不出廠、要長期自主維運」的環境是不可接受的尾部風險。
 
 **理由二：事實形狀不合。**
 現成平台的抽取管線為個人助理最佳化（「使用者住台北」「偏好深色模式」）——原子化、無脈絡。工程知識的價值在**決策理由、失敗→修正的對比、觸發條件**（「當 X 時做 Y 因為 Z」）。要把現成管線改到這個形狀，客製的部分（prompt、schema、驗證、治理）恰恰就是系統的核心——外殼反而是最容易寫的部分。
@@ -150,7 +150,7 @@ opencode.db（唯讀）→ [collector plugin] session.idle 觸發
 | 系統 | 儲存 | 抽取/整理 | 檢索 | on-prem+vLLM | 工程知識契合 | 治理/人審 | wiki 整合成本 | 長期風險 |
 |---|---|---|---|---|---|---|---|---|
 | **opencode-agent-memory（自建）** | markdown 一事一檔 + SQLite FTS5（可重建） | 六型 typed 抽取 + Mem0 迴圈 + 幻覺錨點驗證 + 機密隔離 | BM25 trigram + rank-position boost + CJK fallback | ✅ 原生（vLLM guided_json / opencode-run） | ✅✅ 為此而生（實測驗證） | ✅ 唯一有完整人審閉環（政策記憶變動必過人） | **零**（同格式同生態） | 自己維護（~4k 行 TS、158 tests、零 runtime 依賴核心） |
-| Mem0 OSS v3 | 向量庫 | 抽取 ADD-only（UPDATE/DELETE 付費版限定） | hybrid | ✅ | ✗ 個助形狀、丟推理鏈 | ✗ | 高（DB→md 自建） | **高**（功能持續移入付費版） |
+| Mem0 v3 | 向量庫 | 抽取 ADD-only（自動整合已全面退役，OSS 與平台皆然；手動 CRUD 保留） | hybrid | ✅ | ✗ 個助形狀、丟推理鏈 | ✗ | 高（DB→md 自建） | **高**（graph 從 OSS 移除、招牌 reconcile 迴圈整個產品線消失） |
 | Letta MemFS | markdown+git | dream agents | 記憶樹 + agentic 讀檔 | 局部（自承弱於 open-weight） | ◐ 模式極合、綁 harness | ✗ | 低 | **高**（2026 平台劇變前科） |
 | Graphiti | Neo4j/FalkorDB 時間圖 | LLM 三元組 + bi-temporal 失效 | hybrid+圖遍歷 | ✅ | ◐ 稽核強、敘事碎裂 | ✗ | 高 | 中（活躍但 Python-only） |
 | LangMem | Postgres+pgvector | typed schema 管理 | 語意 | ✅ | ◐ schema 想法好 | ✗ | 高 | 中（半休眠） |
