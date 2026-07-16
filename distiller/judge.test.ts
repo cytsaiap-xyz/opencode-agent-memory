@@ -383,3 +383,75 @@ test("judgeCandidate: boundary values 0 and 10 are valid", async () => {
   expect(verdict.voted).toBe(2)
   expect(verdict.salience).toBe(0) // lower-middle of [0, 10]
 })
+
+// ============ parallel judge panel tests ============
+//
+// judgeCandidate's N judge calls now run via Promise.all instead of a sequential
+// for-loop (see judge.ts). The FakeLlm above resolves synchronously (no internal await
+// before returning), so even under Promise.all its calls still START in array order and
+// each call's reply is bound by call-count index — call order is preserved regardless of
+// concurrency. These tests instead prove the property Promise.all is actually for: judges
+// can be reordered/delayed in when they SETTLE without perturbing the panel's makeup or
+// the median.
+
+// A judge LLM whose Nth call (0-indexed) doesn't resolve until externally released via
+// `release(n)`, so a test can force one judge to be slow while the others resolve
+// immediately — proving the panel doesn't wait for judges sequentially and every judge is
+// still invoked exactly once.
+class GatedJudgeLlm implements LlmClient {
+  callCount = 0
+  responses: string[] = []
+  private gates = new Map<number, { resolve: () => void }>()
+  private pending: Array<() => void> = []
+
+  describe(): string {
+    return "gated-fake"
+  }
+
+  // Mark call index `n` as gated: its complete() won't resolve until release(n) is called.
+  gate(n: number): void {
+    this.pending[n] = () => {}
+  }
+
+  release(n: number): void {
+    this.gates.get(n)?.resolve()
+  }
+
+  async complete(_req: LlmRequest): Promise<string> {
+    const idx = this.callCount
+    this.callCount++
+    const reply = this.responses[idx]!
+    if (idx in this.pending) {
+      await new Promise<void>((resolve) => this.gates.set(idx, { resolve }))
+    }
+    return reply
+  }
+}
+
+test("judgeCandidate: one slow judge (gated) doesn't block the others; all N still called and median unaffected", async () => {
+  const llm = new GatedJudgeLlm()
+  llm.responses = [
+    JSON.stringify({ salience: 3, reason: "low" }),
+    JSON.stringify({ salience: 7, reason: "mid" }),
+    JSON.stringify({ salience: 9, reason: "high" }),
+  ]
+  llm.gate(1) // judge index 1 (the middle vote) is the slow one
+
+  const candidate = cand({ salience: 6 })
+  const verdictPromise = judgeCandidate(candidate, llm, 3)
+
+  // All three calls should have STARTED synchronously (Promise.all fans them out
+  // together) even though judge 1 hasn't resolved yet.
+  expect(llm.callCount).toBe(3)
+
+  // Release the slow judge after the fast ones would already have settled.
+  await Promise.resolve()
+  await Promise.resolve()
+  llm.release(1)
+
+  const verdict = await verdictPromise
+  expect(verdict.panel).toBe(3)
+  expect(verdict.voted).toBe(3)
+  expect(verdict.salience).toBe(7) // median of [3, 7, 9], unaffected by settle order
+  expect(verdict.usedFallback).toBe(false)
+})

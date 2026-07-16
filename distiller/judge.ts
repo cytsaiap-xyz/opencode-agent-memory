@@ -94,36 +94,42 @@ export async function judgeCandidate(
   }
 
   const { system, prompt } = buildJudgePrompt(c)
-  const votes: number[] = []
 
-  // Collect N votes via sequential LLM calls
-  for (let i = 0; i < judges; i++) {
-    try {
-      const response = await llm.complete({ system, prompt, schema: JUDGE_SCHEMA })
-      const cleanedResponse = stripFences(response)
-
-      let parsed: unknown
+  // Collect N votes via independent, concurrent LLM calls. Each of the N closures below is
+  // a single leaf-level `complete()` invocation — Promise.all fans out N INDEPENDENT calls
+  // side by side, never one acquisition nested inside another — so a future concurrency
+  // decorator around `llm.complete` sees exactly N flat acquire/release pairs here.
+  const results = await Promise.all(
+    Array.from({ length: judges }, async (): Promise<number | null> => {
       try {
-        parsed = JSON.parse(cleanedResponse)
+        const response = await llm.complete({ system, prompt, schema: JUDGE_SCHEMA })
+        const cleanedResponse = stripFences(response)
+
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(cleanedResponse)
+        } catch {
+          // JSON parse failed: abstain
+          return null
+        }
+
+        // Extract salience from parsed response
+        const parsed_obj = parsed as Record<string, unknown>
+        const salience = parsed_obj.salience
+        if (typeof salience !== "number" || isNaN(salience) || salience < 0 || salience > 10) {
+          // Invalid salience: abstain
+          return null
+        }
+
+        return salience
       } catch {
-        // JSON parse failed: abstain
-        continue
+        // LLM call failed: abstain
+        return null
       }
+    }),
+  )
 
-      // Extract salience from parsed response
-      const parsed_obj = parsed as Record<string, unknown>
-      const salience = parsed_obj.salience
-      if (typeof salience !== "number" || isNaN(salience) || salience < 0 || salience > 10) {
-        // Invalid salience: abstain
-        continue
-      }
-
-      votes.push(salience)
-    } catch {
-      // LLM call failed: abstain
-      continue
-    }
-  }
+  const votes = results.filter((v): v is number => v !== null)
 
   // Handle verdict based on collected votes
   if (votes.length === 0) {

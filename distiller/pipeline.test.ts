@@ -75,6 +75,34 @@ const scriptedLlmErrors = (replies: Array<string | Error>): LlmClient & { calls:
   return c
 }
 
+// Like scriptedLlmErrors, but call index N (0-indexed, matching extractRuns fan-out order)
+// can be "gated" so its complete() doesn't settle until release(N) is invoked. Used to
+// prove that the parallel extract-runs loop (Promise.all in pipeline.ts) concatenates
+// results in run-index order regardless of which run's LLM call actually SETTLES first —
+// the property Promise.all buys over a sequential for-loop.
+const gatedExtractLlm = (
+  replies: Array<string | Error>,
+  gatedIndices: number[] = [],
+): LlmClient & { calls: number; release: (i: number) => void } => {
+  const gates = new Map<number, () => void>()
+  const obj = {
+    calls: 0,
+    describe: () => "fake",
+    complete: async () => {
+      const idx = obj.calls
+      obj.calls++
+      if (gatedIndices.includes(idx)) {
+        await new Promise<void>((resolve) => gates.set(idx, resolve))
+      }
+      const r = replies[idx] ?? "[]"
+      if (r instanceof Error) throw r
+      return r
+    },
+    release: (i: number) => gates.get(i)?.(),
+  }
+  return obj
+}
+
 const setup = () => {
   const dir = mkdtempSync(join(tmpdir(), "amem-pipe-"))
   const cfg = loadConfig({ AGENT_MEMORY_HOME: dir })
@@ -366,6 +394,81 @@ test("extractRuns=2: ALL runs erroring fails the transcript (errors++, not ledge
   const retryLlm = scriptedLlm([candidateJson("Fix X", "Do Y because Z.")])
   const retry = await runPipeline(cfg, { llm: retryLlm, index }, { now: NOW, triage: "heuristic", extractRuns: 1, judges: 0 })
   expect(retry.ops.added).toBe(1)
+})
+
+// ============ parallel extract-runs tests ============
+//
+// The extract loop now fans out N runs via Promise.all instead of a sequential for-loop
+// (see pipeline.ts). These tests use gatedExtractLlm to force run 1 (call index 0) to
+// SETTLE strictly after run 2 (call index 1), proving the pool concatenation still follows
+// run-index order (not settle order) — the invariant dedupPool's greedy left-to-right merge
+// depends on for determinism.
+
+const racingCandidateJson = (lesson: string) =>
+  JSON.stringify([
+    { type: "pitfall", title: "Racing Duplicate", trigger: "when racing", lesson, domain: ["d"], evidence: [{ message_id: "msg_u1" }], salience: 7, volatile: false },
+  ])
+
+test("extractRuns=2 (parallel): run 1 resolving AFTER run 2 still concatenates in run-index order (tie-break merge proves it)", async () => {
+  const { cfg, index } = setup()
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcript("ses_1", "sha256:h1", "two runs racing"))
+  // Both runs report the SAME (duplicate) candidate with equal-length lessons that differ
+  // only in a marker letter — mergeCandidates' tie-break on equal lesson length keeps
+  // whichever candidate is "a" (i.e., appears FIRST in dedupPool's result array), so the
+  // surviving marker directly exposes concatenation order.
+  const llm = gatedExtractLlm(
+    [racingCandidateJson("Order marker AAAA text."), racingCandidateJson("Order marker BBBB text.")],
+    [0], // run 1 (call index 0) is gated; run 2 (call index 1) resolves immediately
+  )
+  const pipelinePromise = runPipeline(cfg, { llm, index }, { now: NOW, triage: "heuristic", extractRuns: 2, judges: 0 })
+  // Let run 2's already-fired call resolve first, then release the slow run 1.
+  await Promise.resolve()
+  await Promise.resolve()
+  llm.release(0)
+  const s = await pipelinePromise
+
+  expect(s.poolRaw).toBe(2)
+  expect(s.candidates).toBe(1) // the two runs' candidates are duplicates -> merged to 1
+  expect(s.ops.added).toBe(1)
+  const hit = index.search("Racing Duplicate", { status: "active" })[0]!
+  // Run 1 (index 0) is "a" in the merge despite settling last -> its lesson survives the tie.
+  expect(hit.entry.lesson).toBe("Order marker AAAA text.")
+})
+
+test("extractRuns=2 (parallel): one run rejecting AFTER a delay is tolerated, the other run's candidate still commits", async () => {
+  const { cfg, index } = setup()
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcript("ses_1", "sha256:h1", "flaky racing extraction"))
+  const llm = gatedExtractLlm(
+    [new Error("llm hiccup, settles late"), candidateJson("Fix X", "Do Y because Z.")],
+    [0], // run 1 throws, but only after being released (settles after run 2)
+  )
+  const pipelinePromise = runPipeline(cfg, { llm, index }, { now: NOW, triage: "heuristic", extractRuns: 2, judges: 0 })
+  await Promise.resolve()
+  await Promise.resolve()
+  llm.release(0)
+  const s = await pipelinePromise
+
+  expect(s.errors).toBe(0) // one-run error tolerated, not a batch failure
+  expect(s.ops.added).toBe(1)
+  expect(index.ledger.isProcessed("ses_1", "sha256:h1")).toBe(true)
+})
+
+test("extractRuns=2 (parallel): BOTH runs rejecting (one delayed) fails the transcript, not ledgered", async () => {
+  const { cfg, index } = setup()
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcript("ses_1", "sha256:h1", "always fails racing"))
+  const llm = gatedExtractLlm(
+    [new Error("down 1, settles late"), new Error("down 2")],
+    [0], // run 1 fails late (after release); run 2 fails immediately
+  )
+  const pipelinePromise = runPipeline(cfg, { llm, index }, { now: NOW, triage: "heuristic", extractRuns: 2, judges: 0 })
+  await Promise.resolve()
+  await Promise.resolve()
+  llm.release(0)
+  const s = await pipelinePromise
+
+  expect(s.errors).toBe(1)
+  expect(s.ops.added).toBe(0)
+  expect(index.ledger.isProcessed("ses_1", "sha256:h1")).toBe(false)
 })
 
 test("judges: drops a low-median candidate, keeps a high-median one, records per-candidate judge note (not a run-level label suffix)", async () => {

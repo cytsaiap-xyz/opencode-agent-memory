@@ -146,27 +146,40 @@ export async function runPipeline(
         }
       }
 
-      // EXTRACT x N: independent sequential runs. Each run is validated on its own so a
-      // single bad run's schema garbage can't poison the pool. A run that errors is logged
-      // and tolerated; the batch only fails (errors++, not ledgered — retried next run) if
-      // ALL runs error. Concatenated in run-index order — dedupPool is a greedy,
-      // order-dependent left-to-right merge, so the union must stay deterministic.
+      // EXTRACT x N: independent CONCURRENT runs (Promise.all). Each run is validated on
+      // its own so a single bad run's schema garbage can't poison the pool. A run that
+      // errors is logged and tolerated; the batch only fails (errors++, not ledgered —
+      // retried next run) if ALL runs error. `runResults` is indexed by run i regardless of
+      // which call settles first (Promise.all preserves input order), so the concatenation
+      // below stays in run-index order — dedupPool is a greedy, order-dependent
+      // left-to-right merge, and the union must stay deterministic.
+      const runResults = await Promise.all(
+        Array.from({ length: extractRuns }, (_, i) =>
+          (async () => {
+            try {
+              return await extractFromTranscript(meta, deps.llm, salienceMin)
+            } catch (e) {
+              console.error(
+                `distiller: ${meta.sessionId}: extract run ${i + 1}/${extractRuns} failed: ${e instanceof Error ? e.message : String(e)}`,
+              )
+              return null
+            }
+          })(),
+        ),
+      )
+
       let allValid: Candidate[] = []
       let allSecrets: Array<{ item: Candidate; matches: string[] }> = []
       let allRejected: Array<{ item: unknown; reasons: string[] }> = []
       let runErrors = 0
-      for (let i = 0; i < extractRuns; i++) {
-        try {
-          const validated = await extractFromTranscript(meta, deps.llm, salienceMin)
-          allValid = allValid.concat(validated.valid)
-          allSecrets = allSecrets.concat(validated.secrets)
-          allRejected = allRejected.concat(validated.rejected)
-        } catch (e) {
+      for (const validated of runResults) {
+        if (validated === null) {
           runErrors++
-          console.error(
-            `distiller: ${meta.sessionId}: extract run ${i + 1}/${extractRuns} failed: ${e instanceof Error ? e.message : String(e)}`,
-          )
+          continue
         }
+        allValid = allValid.concat(validated.valid)
+        allSecrets = allSecrets.concat(validated.secrets)
+        allRejected = allRejected.concat(validated.rejected)
       }
       if (runErrors === extractRuns) {
         throw new Error(`all ${extractRuns} extraction runs failed`)
