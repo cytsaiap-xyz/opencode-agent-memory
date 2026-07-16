@@ -577,6 +577,7 @@ introducing its own knobs.
 | `AGENT_MEMORY_EXTRACT_RUNS` | `2` | Integer `[1, 5]` — self-consistency extraction runs per transcript, see below. |
 | `AGENT_MEMORY_JUDGES` | `3` | Integer `[0, 5]` — judge panel size for salience consensus, see below. `0` or `1` disables. |
 | `AGENT_MEMORY_CONCURRENCY` | `8` | Integer `[1, 32]` — global cap on in-flight LLM calls (`distill run` and `distill reflect` both wrap their LLM client in this limiter), see "Parallel processing" below. |
+| `AGENT_MEMORY_LLM_TIMEOUT_MS` | `600000` (10 min) | Integer `>= 1000` — per-call timeout for every `LlmClient.complete()` call (`clientFromEnv` applies it uniformly to both the vLLM `fetch` and the `opencode-run` subprocess). A timed-out call aborts the fetch (or kills the subprocess) and throws `llm call timed out after <ms>ms`, absorbed by the same fail-open/tolerate paths as any other LLM error — this guards against a hung call pinning an `AGENT_MEMORY_CONCURRENCY` permit and stalling the nightly run forever. |
 
 `AGENT_MEMORY_HOME` (see the collector's Configuration table above) is shared
 — it also determines `store/` and `transcripts/` for the distiller.

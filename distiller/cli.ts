@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs"
 import { join } from "node:path"
 import { loadConfig } from "../shared/config"
 import { probeSqlite } from "../shared/sqliteProbe"
-import { clientFromEnv, type LlmClient } from "./llm"
+import { clientFromEnv, DEFAULT_LLM_TIMEOUT_MS, type LlmClient } from "./llm"
 import { withConcurrencyLimit } from "./limiter"
 import { openMemoryIndex, type MemoryQuery } from "./indexes"
 import { runPipeline } from "./pipeline"
@@ -62,6 +62,11 @@ export async function runCli(
         const extractRuns = numEnv(env, "AGENT_MEMORY_EXTRACT_RUNS", 2, (n) => Number.isInteger(n) && n >= 1 && n <= 5)
         const judges = numEnv(env, "AGENT_MEMORY_JUDGES", 3, (n) => Number.isInteger(n) && n >= 0 && n <= 5)
         const concurrency = numEnv(env, "AGENT_MEMORY_CONCURRENCY", 8, (n) => Number.isInteger(n) && n >= 1 && n <= 32)
+        // Validated here too (like every other AGENT_MEMORY_* env), unconditionally — even
+        // when deps.llm bypasses clientFromEnv below (matching AGENT_MEMORY_CONCURRENCY's own
+        // pattern above). clientFromEnv is still the single source of truth that actually reads
+        // and applies this value to every real client-creation path, not just the CLI.
+        numEnv(env, "AGENT_MEMORY_LLM_TIMEOUT_MS", DEFAULT_LLM_TIMEOUT_MS, (n) => Number.isInteger(n) && n >= 1000)
         const pi = rest.indexOf("--project")
         const project = pi >= 0 ? rest[pi + 1] : undefined
         if (pi >= 0 && !project) throw new Error("--project needs a value")
@@ -85,6 +90,7 @@ export async function runCli(
         const salienceMin = numEnv(env, "AGENT_MEMORY_SALIENCE_MIN", 6, (n) => n >= 0 && n <= 10)
         const judges = numEnv(env, "AGENT_MEMORY_JUDGES", 3, (n) => Number.isInteger(n) && n >= 0 && n <= 5)
         const concurrency = numEnv(env, "AGENT_MEMORY_CONCURRENCY", 8, (n) => Number.isInteger(n) && n >= 1 && n <= 32)
+        numEnv(env, "AGENT_MEMORY_LLM_TIMEOUT_MS", DEFAULT_LLM_TIMEOUT_MS, (n) => Number.isInteger(n) && n >= 1000)
         let project: string | undefined
         let dryRun = false
         for (let i = 0; i < rest.length; i++) {

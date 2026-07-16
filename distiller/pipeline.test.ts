@@ -518,6 +518,51 @@ test("full quality-pack defaults (triage llm, extractRuns 2, judges 3) run end t
   expect(hit.entry.notes.some((n) => n.includes("judged: median 7 (3/3)"))).toBe(true)
 })
 
+test("spec §1.2: judge panels across DIFFERENT candidates run concurrently, not one candidate's panel at a time", async () => {
+  const { cfg, index } = setup()
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcript("ses_1", "sha256:h1", "two judged candidates"))
+
+  // Non-overlapping vocabulary (see the extractRuns=2 test above for why — a shared word
+  // would make candidate B's RECONCILE search spuriously match candidate A's just-committed
+  // entry). A defensive reconcile branch (recognized by RECONCILE_SYSTEM's own text, same as
+  // the equivalence test's content-keyed fake below) still always answers ADD, in case any
+  // overlap slips through — this test cares about judge concurrency, not reconcile routing.
+  let judgeInFlight = 0
+  let maxJudgeInFlight = 0
+  const llm: LlmClient & { calls: number } = {
+    calls: 0,
+    describe: () => "fake",
+    complete: async (req: LlmRequest) => {
+      llm.calls++
+      if (req.system?.includes("You reconcile a candidate memory")) return JSON.stringify({ op: "ADD" })
+      const isJudge = req.system?.includes("You are a judge evaluating") ?? false
+      if (!isJudge) {
+        return candidatesJson([
+          { title: "Quokka Cache Eviction", lesson: "Evict cache entries eagerly on cold start." },
+          { title: "Narwhal Retry Timeout", lesson: "Raise the socket deadline before retrying." },
+        ])
+      }
+      judgeInFlight++
+      maxJudgeInFlight = Math.max(maxJudgeInFlight, judgeInFlight)
+      // Hold the call open briefly so overlapping panels (both candidates' judge calls
+      // in flight at once) actually get observed, not just theoretically possible.
+      await new Promise<void>((resolve) => setTimeout(resolve, 5))
+      judgeInFlight--
+      return judgeJson(8)
+    },
+  }
+
+  // judges=2: each candidate's OWN panel already fires 2 calls concurrently via
+  // judgeCandidate's internal Promise.all (judge.ts) — that alone could reach
+  // maxJudgeInFlight=2 even under the OLD sequential-across-candidates loop. Proving the
+  // fix requires seeing MORE than 2 in flight at once, i.e. candidate 1's and candidate
+  // 2's panels overlapping (up to 4 total: 2 candidates x 2 judges each).
+  const s = await runPipeline(cfg, { llm, index }, { now: NOW, triage: "heuristic", extractRuns: 1, judges: 2 })
+
+  expect(s.ops.added).toBe(2)
+  expect(maxJudgeInFlight).toBeGreaterThan(2)
+})
+
 // ============ Task 3: two-phase pipeline + determinism equivalence ============
 //
 // These tests use a FileScan (ledger.jsonl) store instead of the sqlite setup() helper
@@ -770,6 +815,9 @@ test("FIX 1: dedupe dispatch by session+hash; two files with identical session_i
   expect(index.ledger.isProcessed("ses_dup", "sha256:hduplicate")).toBe(true)
   // The store has exactly one memory entry for the candidate (not one per file)
   expect(index.search("Dup Candidate", { status: "active" }).length).toBe(1)
+  // FIX 4: the dropped duplicate counts into skippedProcessed (same counter an
+  // already-ledgered/isProcessed session would bump), not just a stderr line.
+  expect(s.skippedProcessed).toBe(1)
 })
 
 test("FIX 2: concurrency 2 with 10 transcripts; max concurrent Phase-A tasks stays bounded at concurrency limit", async () => {

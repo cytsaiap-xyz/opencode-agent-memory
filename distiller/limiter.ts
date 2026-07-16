@@ -5,7 +5,6 @@ export class Semaphore {
   private inFlight: number = 0
   private waiters: Array<{
     resolve: (release: () => void) => void
-    reject: (err: Error) => void
   }> = []
 
   constructor(limit: number) {
@@ -21,8 +20,8 @@ export class Semaphore {
       return this.createRelease()
     }
 
-    return new Promise((resolve, reject) => {
-      this.waiters.push({ resolve, reject })
+    return new Promise((resolve) => {
+      this.waiters.push({ resolve })
     })
   }
 

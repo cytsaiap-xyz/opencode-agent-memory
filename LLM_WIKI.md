@@ -385,6 +385,8 @@ process 搶 CPU/記憶體，不會真的變快，所以對著 `opencode-run` 跑
 `AGENT_MEMORY_CONCURRENCY=2`（VERIFY-parallel.md 的 A/B 實測也印證了這一
 點——見該文件）。
 
+**`AGENT_MEMORY_LLM_TIMEOUT_MS`（預設 10 分鐘，整數 `>= 1000`，`clientFromEnv` 統一套用）**——`llm.ts` 對每次 `complete()` 呼叫都設了逾時：vLLM 走 `AbortController` 中止 `fetch`，`opencode-run` 則 `proc.kill()` 掉卡住的 subprocess，逾時一律拋 `llm call timed out after <ms>ms` 這個一般 Error，被跟其他 LLM 錯誤完全相同的 fail-open/tolerate 路徑吸收（EXTRACT 容忍、JUDGE 棄權、TRIAGE fail-open）——沒有這個逾時，一次卡住的呼叫會讓 `withConcurrencyLimit` 的 permit 永遠釋放不出去，nightly cron 也就永遠跑不完，隔天排程一到就會有兩個 process 同時寫同一個 store。
+
 ### 六型分類（`extract.ts`、`types.ts: MemoryType`）
 
 `decision`（技術決策+理由，尤其是使用者推翻 agent 建議的情況）、

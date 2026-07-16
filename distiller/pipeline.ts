@@ -194,9 +194,20 @@ async function prepareTranscript(meta: TranscriptMeta, llm: LlmClient, opts: Pre
     // panel: 0 — see judge.ts); gating the loop the same way here just skips the
     // pointless per-candidate call, it isn't required for correctness.
     if (opts.judges > 1) {
+      // Spec §1.2: judge panels across candidates run CONCURRENTLY, not one candidate's
+      // panel at a time. judgeCandidate never rejects (every LLM/parse failure inside it is
+      // caught and turned into an abstention — see judge.ts), so Promise.all here can't
+      // short-circuit on a per-candidate rejection; each closure is a single leaf-level
+      // judgeCandidate call, side by side, same flat fan-out shape as judge.ts's own
+      // per-candidate panel and prepareTranscript's EXTRACT×N loop above. Promise.all
+      // preserves input order regardless of which candidate's panel settles first, so
+      // mapping to { c, verdict } and then filtering/pushing in a plain for-loop keeps
+      // `kept` in the same order as pooled.candidates.
+      const judged = await Promise.all(
+        pooled.candidates.map(async (c) => ({ c, verdict: await judgeCandidate(c, llm, opts.judges) })),
+      )
       const kept: Candidate[] = []
-      for (const c of pooled.candidates) {
-        const verdict = await judgeCandidate(c, llm, opts.judges)
+      for (const { c, verdict } of judged) {
         console.error(
           `distiller: ${meta.sessionId}: judge: ${c.title} self:${verdict.selfScore} median:${verdict.salience} panel:${verdict.voted}/${verdict.panel}`,
         )
@@ -270,6 +281,11 @@ export async function runPipeline(
     const dedupeKey = `${meta.sessionId}|${meta.contentHash}`
     if (seenTranscripts.has(dedupeKey)) {
       console.error(`distiller: duplicate dispatch: ${meta.sessionId}/${meta.contentHash} (first wins, dropping)`)
+      // Same (session_id, content_hash) as an already-dispatched transcript this run — this
+      // is functionally "already handled this run" the same way an isProcessed ledger hit
+      // is "already handled a prior run", so it counts into skippedProcessed too (legacy
+      // counter semantics: skippedProcessed == "eligible but not actually processed").
+      summary.skippedProcessed++
       continue
     }
     seenTranscripts.add(dedupeKey)

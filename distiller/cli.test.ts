@@ -140,6 +140,21 @@ test("bad AGENT_MEMORY_CONCURRENCY is a friendly error on both run and reflect, 
   expect(err.join("\n")).toContain("AGENT_MEMORY_CONCURRENCY")
 })
 
+test("bad AGENT_MEMORY_LLM_TIMEOUT_MS is a friendly error on both run and reflect, exit 1", async () => {
+  const { env, err, deps } = setup()
+  err.length = 0
+  expect(await runCli(["run"], { ...env, AGENT_MEMORY_LLM_TIMEOUT_MS: "banana" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_LLM_TIMEOUT_MS")
+
+  err.length = 0
+  expect(await runCli(["run"], { ...env, AGENT_MEMORY_LLM_TIMEOUT_MS: "500" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_LLM_TIMEOUT_MS")
+
+  err.length = 0
+  expect(await runCli(["reflect"], { ...env, AGENT_MEMORY_LLM_TIMEOUT_MS: "banana" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_LLM_TIMEOUT_MS")
+})
+
 test("AGENT_MEMORY_CONCURRENCY=2 smoke: run still distills and prints the same summary shape", async () => {
   const { dir, env, out, deps } = setup()
   mkdirSync(join(dir, "transcripts", "proja"), { recursive: true })
