@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test"
-import { mkdirSync, mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync } from "node:fs"
+import { mkdirSync, mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { loadConfig } from "../shared/config"
-import type { LlmClient } from "./llm"
+import type { LlmClient, LlmRequest } from "./llm"
 import { openMemoryIndex } from "./indexes"
 import { renderIndexMd, runPipeline } from "./pipeline"
 import { entryPath, quarantinePath, serializeEntry } from "./store"
@@ -118,7 +118,7 @@ const NOW = new Date("2026-07-11T00:00:00.000Z") // 23h after time_end -> eligib
 // more calls per session than the old single-pass pipeline did, which would desync every
 // scripted sequence below. Pin the pre-quality-pack semantics explicitly so this file keeps
 // testing exactly what it always tested; the new defaults get their own dedicated tests.
-const LEGACY = { triage: "heuristic" as const, extractRuns: 1, judges: 0 }
+const LEGACY = { triage: "heuristic" as const, extractRuns: 1, judges: 0, concurrency: 1 }
 
 test("end-to-end: extract -> add; rerun is idempotent; INDEX.md rendered", async () => {
   const { cfg, index } = setup()
@@ -516,4 +516,234 @@ test("full quality-pack defaults (triage llm, extractRuns 2, judges 3) run end t
   expect(hit.entry.provenance.extractor).not.toContain("judges:")
   // median of [6,7,8] = 7 (odd, middle value), 3/3 judges voted.
   expect(hit.entry.notes.some((n) => n.includes("judged: median 7 (3/3)"))).toBe(true)
+})
+
+// ============ Task 3: two-phase pipeline + determinism equivalence ============
+//
+// These tests use a FileScan (ledger.jsonl) store instead of the sqlite setup() helper
+// above for two reasons: (1) ledger.jsonl is trivially readable/parseable straight from the
+// test (no need to open a second raw sqlite connection just to inspect ledger rows), and
+// (2) it keeps storeDir free of an index.db binary, so "recursively compare the store tree"
+// only ever means markdown files.
+
+const setupFilescan = () => {
+  const dir = mkdtempSync(join(tmpdir(), "amem-pipe2-"))
+  const cfg = loadConfig({ AGENT_MEMORY_HOME: dir })
+  mkdirSync(join(cfg.transcriptsDir, "proja"), { recursive: true })
+  mkdirSync(cfg.storeDir, { recursive: true })
+  const index = openMemoryIndex(cfg.storeDir, { ok: false, reason: "test" }, { warn: () => {} })
+  return { dir, cfg, index }
+}
+
+// Same frontmatter shape as `transcript` above but with a parametrized time_end, so three
+// transcripts processed in one run can be given a strict, unambiguous dispatch order
+// (scanSpool sorts by time_end) independent of filesystem directory-listing order.
+const transcriptAt = (sessionId: string, hash: string, timeEnd: string, text: string) => `---
+session_id: ${sessionId}
+project_dir: "/x/proja"
+title: "t"
+model: m
+time_start: 2026-07-10T00:00:00.000Z
+time_end: ${timeEnd}
+turns: 2
+tokens: { input: 1, output: 1 }
+content_hash: ${hash}
+exported_at: 2026-07-10T02:00:00.000Z
+---
+## T1 [00:00] User {#msg_u1}
+
+${text}${PAD}
+
+## T2 [00:01] Assistant {#msg_a1}
+
+answer
+`
+
+// Recursively reads every file under `dir` into a flat { relativePath: content } object —
+// used to diff two scratch stores' memories/ or quarantine/ trees byte-for-byte. A plain
+// object (not a Map) so bun:test's toEqual does a real deep structural comparison.
+const collectFiles = (dir: string): Record<string, string> => {
+  const out: Record<string, string> = {}
+  const walk = (d: string, prefix: string) => {
+    let names: string[]
+    try {
+      names = readdirSync(d)
+    } catch {
+      return
+    }
+    for (const n of names) {
+      const full = join(d, n)
+      const rel = prefix ? `${prefix}/${n}` : n
+      if (statSync(full).isDirectory()) walk(full, rel)
+      else out[rel] = readFileSync(full, "utf8")
+    }
+  }
+  walk(dir, "")
+  return out
+}
+
+const readLedgerRows = (storeDir: string): Array<Record<string, unknown>> => {
+  let raw: string
+  try {
+    raw = readFileSync(join(storeDir, "ledger.jsonl"), "utf8")
+  } catch {
+    return []
+  }
+  return raw.split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l))
+}
+
+test("EQUIVALENCE: concurrency 1 vs 4 produce byte-identical store trees, equal ledger row sets (ignoring processed_at), and equal summaries", async () => {
+  // Content-keyed markers embedded in each transcript's body — the FakeLlm below picks its
+  // reply by inspecting req.prompt/req.system content, NEVER by call order/index, so it is
+  // safe to reuse across two runs whose Phase A tasks race each other differently.
+  const MARKER_A = "TRANSCRIPT-MARKER-ALPHA"
+  const MARKER_B = "TRANSCRIPT-MARKER-BRAVO"
+  const MARKER_C = "TRANSCRIPT-MARKER-CHARLIE"
+
+  // All three transcripts extract the SAME candidate title (overlapping candidates) — the
+  // first transcript processed in Phase B commits ADD, the other two's reconcile calls
+  // collide on the same deterministic entryId(project, title, now) and fall through
+  // addEntry's auto-degrade-to-UPDATE path, so both UPDATE reconcile outcomes actually fire.
+  const sharedCandidateJson = (marker: string) =>
+    candidateJson("Cache Warm Bug", `Warm the cache eagerly on cold start. (${marker})`)
+
+  // ses_c's extraction ALSO reports a secret candidate alongside the shared one, so the
+  // equivalence check has a non-empty quarantine/ tree to compare too, not just memories/.
+  const mixedCandidateJson = () =>
+    JSON.stringify([
+      { type: "pitfall", title: "Cache Warm Bug", trigger: "when x", lesson: `Warm the cache eagerly on cold start. (${MARKER_C})`, domain: ["d"], evidence: [{ message_id: "msg_u1" }], salience: 7, volatile: false },
+      { type: "know_how", title: "Leaked Key", trigger: "when deploying", lesson: "Never set AKIA0123456789ABCDEF as env var.", domain: ["d"], evidence: [{ message_id: "msg_u1" }], salience: 7, volatile: false },
+    ])
+
+  const buildContentKeyedLlm = (): LlmClient & { calls: number } => {
+    const c = {
+      calls: 0,
+      describe: () => "content-fake",
+      complete: async (req: LlmRequest): Promise<string> => {
+        c.calls++
+        // Reconcile calls are recognized by their system prompt content (never by call
+        // order): always reply ADD — for the 2nd/3rd overlapping candidate this still
+        // surfaces as an UPDATE because addEntry degrades an ADD to UPDATE when the
+        // computed entryId collides with an already-active entry.
+        if (req.system?.includes("You reconcile a candidate memory")) return JSON.stringify({ op: "ADD" })
+        if (req.prompt.includes(MARKER_A)) return sharedCandidateJson(MARKER_A)
+        if (req.prompt.includes(MARKER_B)) return sharedCandidateJson(MARKER_B)
+        if (req.prompt.includes(MARKER_C)) return mixedCandidateJson()
+        return "[]"
+      },
+    }
+    return c
+  }
+
+  const buildStore = async (concurrency: number) => {
+    const { cfg, index } = setupFilescan()
+    writeFileSync(join(cfg.transcriptsDir, "proja", "ses_a.md"), transcriptAt("ses_a", "sha256:ha", "2026-07-10T01:00:00.000Z", MARKER_A))
+    writeFileSync(join(cfg.transcriptsDir, "proja", "ses_b.md"), transcriptAt("ses_b", "sha256:hb", "2026-07-10T02:00:00.000Z", MARKER_B))
+    writeFileSync(join(cfg.transcriptsDir, "proja", "ses_c.md"), transcriptAt("ses_c", "sha256:hc", "2026-07-10T03:00:00.000Z", MARKER_C))
+    const llm = buildContentKeyedLlm()
+    const summary = await runPipeline(cfg, { llm, index }, { now: NOW, triage: "heuristic", extractRuns: 1, judges: 0, concurrency })
+    return { cfg, summary, llmCalls: llm.calls }
+  }
+
+  const run1 = await buildStore(1)
+  const run4 = await buildStore(4)
+
+  // Sanity: the overlapping-candidate reconcile path actually fired (1 ADD, 2 UPDATEs), not
+  // just 3 independent ADDs — this is the scenario the brief specifically asks for.
+  expect(run1.summary.ops.added).toBe(1)
+  expect(run1.summary.ops.updated).toBe(2)
+  expect(run1.summary.quarantined).toBe(1)
+
+  expect(run1.summary).toEqual(run4.summary)
+  expect(run1.llmCalls).toBe(run4.llmCalls)
+
+  expect(collectFiles(join(run1.cfg.storeDir, "memories"))).toEqual(collectFiles(join(run4.cfg.storeDir, "memories")))
+  expect(collectFiles(join(run1.cfg.storeDir, "quarantine"))).toEqual(collectFiles(join(run4.cfg.storeDir, "quarantine")))
+  expect(readFileSync(join(run1.cfg.storeDir, "INDEX.md"), "utf8")).toBe(readFileSync(join(run4.cfg.storeDir, "INDEX.md"), "utf8"))
+
+  const strip = (rows: Array<Record<string, unknown>>) =>
+    rows
+      .map(({ processed_at: _processed_at, ...rest }) => rest)
+      .sort((a, b) => (a.session_id as string).localeCompare(b.session_id as string))
+  expect(strip(readLedgerRows(run1.cfg.storeDir))).toEqual(strip(readLedgerRows(run4.cfg.storeDir)))
+})
+
+test("phase-B ordering: transcript 1's Phase A task finishing LAST does not reorder its Phase B commit — ledger insertion order still follows metas order", async () => {
+  const { cfg, index } = setupFilescan()
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_first.md"), transcriptAt("ses_first", "sha256:h1", "2026-07-10T01:00:00.000Z", "gated first transcript"))
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_second.md"), transcriptAt("ses_second", "sha256:h2", "2026-07-10T02:00:00.000Z", "fast second transcript"))
+
+  // ses_first's (metas-first) extraction call is gated — it won't settle until release()
+  // is called — while ses_second's call resolves immediately. With concurrency >= 2 both
+  // Phase A tasks start together, but ses_first's Phase A finishes strictly LAST.
+  let releaseFirst: (() => void) | undefined
+  const llm: LlmClient & { calls: number } = {
+    calls: 0,
+    describe: () => "gated-content-fake",
+    complete: async (req: LlmRequest): Promise<string> => {
+      llm.calls++
+      if (req.prompt.includes("gated first transcript")) {
+        await new Promise<void>((resolve) => { releaseFirst = resolve })
+      }
+      return "[]" // no candidates from either transcript — this test only cares about commit/ledger order
+    },
+  }
+
+  const pipelinePromise = runPipeline(cfg, { llm, index }, { now: NOW, triage: "heuristic", extractRuns: 1, judges: 0, concurrency: 2 })
+  // Let ses_second's already-fired (ungated) call resolve first...
+  await Promise.resolve()
+  await Promise.resolve()
+  expect(releaseFirst).toBeDefined() // ses_first's call has started and is parked on the gate
+  // ...then release ses_first so its Phase A task settles last.
+  releaseFirst!()
+  const summary = await pipelinePromise
+
+  expect(summary.errors).toBe(0)
+  expect(summary.triagedOut).toBe(0) // both bodies clear the heuristic floor; extraction just returns "[]"
+  expect(summary.candidates).toBe(0)
+  const rows = readLedgerRows(cfg.storeDir)
+  expect(rows.map((r) => r.session_id)).toEqual(["ses_first", "ses_second"]) // metas order, not settle order
+})
+
+test("Phase A write-freeze: every transcript's Phase A task throwing leaves the store completely untouched — no memories/, no quarantine/, no ledger row for any of them", async () => {
+  const { cfg, index } = setupFilescan()
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcriptAt("ses_1", "sha256:h1", "2026-07-10T01:00:00.000Z", "always fails one"))
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_2.md"), transcriptAt("ses_2", "sha256:h2", "2026-07-10T02:00:00.000Z", "always fails two"))
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_3.md"), transcriptAt("ses_3", "sha256:h3", "2026-07-10T03:00:00.000Z", "always fails three"))
+
+  const llm: LlmClient = { describe: () => "always-throws", complete: async () => { throw new Error("llm down for every call") } }
+  const summary = await runPipeline(cfg, { llm, index }, { now: NOW, triage: "heuristic", extractRuns: 1, judges: 0, concurrency: 4 })
+
+  expect(summary.errors).toBe(3)
+  expect(summary.ops).toEqual({ added: 0, updated: 0, superseded: 0, nooped: 0 })
+  expect(summary.quarantined).toBe(0)
+  expect(summary.candidates).toBe(0)
+  expect(summary.poolRaw).toBe(0)
+
+  // No Phase-A writes: neither memories/ nor quarantine/ was ever created.
+  expect(existsSync(join(cfg.storeDir, "memories"))).toBe(false)
+  expect(existsSync(join(cfg.storeDir, "quarantine"))).toBe(false)
+  // No Phase-B writes either: nothing was ever ledgered (the ledger.jsonl file itself is
+  // never created, since recordProcessed is never reached for an error-kind transcript).
+  expect(existsSync(join(cfg.storeDir, "ledger.jsonl"))).toBe(false)
+  for (const id of ["ses_1", "ses_2", "ses_3"]) expect(index.ledger.isProcessed(id, `sha256:h${id.slice(-1)}`)).toBe(false)
+  // renderIndexMd still runs unconditionally (PUBLISH-once-at-the-end is not a Phase-A
+  // write) but with nothing to list — this is the one file the store dir is allowed to
+  // contain after a total Phase-A wipeout.
+  const indexMd = readFileSync(join(cfg.storeDir, "INDEX.md"), "utf8")
+  expect(indexMd).toBe("# Memory Index\n")
+})
+
+test("all-error transcript is not ledgered at concurrency 4 (error semantics unchanged by the two-phase refactor)", async () => {
+  const { cfg, index } = setupFilescan()
+  writeFileSync(join(cfg.transcriptsDir, "proja", "ses_1.md"), transcriptAt("ses_1", "sha256:h1", "2026-07-10T01:00:00.000Z", "always fails"))
+  const failingLlm = scriptedLlmErrors([new Error("down 1"), new Error("down 2")])
+  const s = await runPipeline(cfg, { llm: failingLlm, index }, { now: NOW, triage: "heuristic", extractRuns: 2, judges: 0, concurrency: 4 })
+  expect(s.errors).toBe(1)
+  expect(s.ops.added).toBe(0)
+  expect(index.ledger.isProcessed("ses_1", "sha256:h1")).toBe(false)
+
+  const retryLlm = scriptedLlm([candidateJson("Fix X", "Do Y because Z.")])
+  const retry = await runPipeline(cfg, { llm: retryLlm, index }, { now: NOW, triage: "heuristic", extractRuns: 1, judges: 0, concurrency: 4 })
+  expect(retry.ops.added).toBe(1)
 })
