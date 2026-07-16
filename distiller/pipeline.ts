@@ -257,7 +257,9 @@ export async function runPipeline(
   // but the resulting dispatch list must be built up front (not decided inside a concurrent
   // task) so Phase A's fan-out and Phase B's commit order both work off one fixed,
   // deterministic list of transcripts, in scanSpool's stable (time_end) order.
+  // Dedupe by (session_id, content_hash) during pre-pass — first wins, duplicates logged.
   const dispatch: TranscriptMeta[] = []
+  const seenTranscripts = new Set<string>()
   for (const meta of metas) {
     if (!isEligible(meta, now, idleHours)) continue
     summary.eligible++
@@ -265,6 +267,12 @@ export async function runPipeline(
       summary.skippedProcessed++
       continue
     }
+    const dedupeKey = `${meta.sessionId}|${meta.contentHash}`
+    if (seenTranscripts.has(dedupeKey)) {
+      console.error(`distiller: duplicate dispatch: ${meta.sessionId}/${meta.contentHash} (first wins, dropping)`)
+      continue
+    }
+    seenTranscripts.add(dedupeKey)
     dispatch.push(meta)
   }
 
@@ -318,6 +326,12 @@ export async function runPipeline(
     }
 
     // p.kind === "ready"
+    // Defensive re-check: even after dedupe in pre-pass, guard against concurrent writes
+    // to the same (session_id, content_hash) pair if one somehow slipped through.
+    if (deps.index.ledger.isProcessed(p.meta.sessionId, p.meta.contentHash)) {
+      console.error(`distiller: ${p.meta.sessionId} already processed (defensive re-check), skipping`)
+      continue
+    }
     summary.rejected += p.rejected
     summary.poolRaw += p.poolRaw
     summary.candidates += p.candidates

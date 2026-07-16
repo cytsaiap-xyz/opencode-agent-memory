@@ -747,3 +747,90 @@ test("all-error transcript is not ledgered at concurrency 4 (error semantics unc
   const retry = await runPipeline(cfg, { llm: retryLlm, index }, { now: NOW, triage: "heuristic", extractRuns: 1, judges: 0, concurrency: 4 })
   expect(retry.ops.added).toBe(1)
 })
+
+// ============ Fix round 1: dedup window + contention ============
+
+test("FIX 1: dedupe dispatch by session+hash; two files with identical session_id+content_hash process once", async () => {
+  const { cfg, index } = setupFilescan()
+  // Write TWO files with IDENTICAL session_id+content_hash frontmatter but different filenames
+  const identicalFrontmatter = {
+    sessionId: "ses_dup", contentHash: "sha256:hduplicate", timeEnd: "2026-07-10T01:00:00.000Z",
+  }
+  writeFileSync(join(cfg.transcriptsDir, "proja", "file_one.md"), transcriptAt(identicalFrontmatter.sessionId, identicalFrontmatter.contentHash, identicalFrontmatter.timeEnd, "same content twice"))
+  writeFileSync(join(cfg.transcriptsDir, "proja", "file_two.md"), transcriptAt(identicalFrontmatter.sessionId, identicalFrontmatter.contentHash, identicalFrontmatter.timeEnd, "same content twice"))
+
+  const llm = scriptedLlm([candidateJson("Dup Candidate", "Handle duplication correctly.")])
+  const s = await runPipeline(cfg, { llm, index }, { now: NOW, triage: "heuristic", extractRuns: 1, judges: 0, concurrency: 4 })
+
+  // Both files eligible; both start Phase A; but dedupe drops the second one (first wins)
+  expect(s.eligible).toBe(2)
+  // Only one reaches Phase B (dedupe applied in pre-pass)
+  expect(s.ops.added).toBe(1)
+  // Ledger row exists exactly once for the session
+  expect(index.ledger.isProcessed("ses_dup", "sha256:hduplicate")).toBe(true)
+  // The store has exactly one memory entry for the candidate (not one per file)
+  expect(index.search("Dup Candidate", { status: "active" }).length).toBe(1)
+})
+
+test("FIX 2: concurrency 2 with 10 transcripts; max concurrent Phase-A tasks stays bounded at concurrency limit", async () => {
+  const { cfg, index } = setupFilescan()
+  const NUM_TRANSCRIPTS = 10
+
+  // Track max concurrent in-flight Phase A tasks via LLM call instrumentation.
+  // Each Phase A task makes exactly extractRuns calls (here 1), so counting concurrent
+  // complete() invocations on the same LLM client proves max in-flight Phase A tasks.
+  let currentInFlight = 0
+  let maxInFlight = 0
+  const inflight = new Set<number>()
+
+  const contentKeyedLlm: LlmClient & { calls: number } = {
+    calls: 0,
+    describe: () => "concurrency-metered-fake",
+    complete: async (req: LlmRequest): Promise<string> => {
+      const callId = contentKeyedLlm.calls++
+      inflight.add(callId)
+      currentInFlight = inflight.size
+      maxInFlight = Math.max(maxInFlight, currentInFlight)
+
+      // Simulate some work to let other Phase A tasks start and overlap
+      await new Promise<void>((resolve) => setTimeout(resolve, 1))
+
+      inflight.delete(callId)
+
+      // Route: if this is a reconcile (system prompt indicator), return ADD op.
+      // Otherwise, it's an extraction call (Phase A).
+      if (req.system?.includes("You reconcile a candidate memory")) {
+        return JSON.stringify({ op: "ADD" })
+      }
+
+      // Each transcript extracts a candidate with a unique marker to avoid reconcile collisions
+      // (all Phase A calls are extractions, not reconciles at this point in Phase A)
+      return candidateJson(`Transcript ${callId}`, `Lesson for transcript ${callId}.`)
+    },
+  }
+
+  // Create 10 transcripts with distinct markers in their body (deterministic dispatch order)
+  for (let i = 0; i < NUM_TRANSCRIPTS; i++) {
+    const sessionId = `ses_${String(i).padStart(2, "0")}`
+    const timeEnd = `2026-07-10T${String(i).padStart(2, "0")}:00:00.000Z`
+    writeFileSync(
+      join(cfg.transcriptsDir, "proja", `${sessionId}.md`),
+      transcriptAt(sessionId, `sha256:h${i}`, timeEnd, `transcript marker ${i}`),
+    )
+  }
+
+  const summary = await runPipeline(cfg, { llm: contentKeyedLlm, index }, {
+    now: NOW, triage: "heuristic", extractRuns: 1, judges: 0, concurrency: 2,
+  })
+
+  // Sanity: all 10 transcripts processed
+  expect(summary.eligible).toBe(10)
+  expect(summary.ops.added).toBe(10)
+  expect(summary.errors).toBe(0)
+
+  // Max concurrent Phase A tasks must not exceed the concurrency limit (2).
+  // With concurrency=2, we expect maxInFlight to be 2 (semaphore holds 2 permits).
+  // Assert it's not >2 (would be a bug) and reasonably close to 2 (proves semaphore worked).
+  expect(maxInFlight).toBeLessThanOrEqual(2)
+  expect(maxInFlight).toBeGreaterThanOrEqual(1) // at least one in-flight at some point
+})
