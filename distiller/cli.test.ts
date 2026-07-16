@@ -117,6 +117,50 @@ test("bad AGENT_MEMORY_TRIAGE / AGENT_MEMORY_EXTRACT_RUNS / AGENT_MEMORY_JUDGES 
   expect(err.join("\n")).toContain("AGENT_MEMORY_JUDGES")
 })
 
+test("bad AGENT_MEMORY_CONCURRENCY is a friendly error on both run and reflect, exit 1", async () => {
+  const { env, err, deps } = setup()
+  err.length = 0
+  expect(await runCli(["run"], { ...env, AGENT_MEMORY_CONCURRENCY: "banana" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_CONCURRENCY")
+
+  err.length = 0
+  expect(await runCli(["run"], { ...env, AGENT_MEMORY_CONCURRENCY: "0" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_CONCURRENCY")
+
+  err.length = 0
+  expect(await runCli(["run"], { ...env, AGENT_MEMORY_CONCURRENCY: "33" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_CONCURRENCY")
+
+  err.length = 0
+  expect(await runCli(["run"], { ...env, AGENT_MEMORY_CONCURRENCY: "1.5" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_CONCURRENCY")
+
+  err.length = 0
+  expect(await runCli(["reflect"], { ...env, AGENT_MEMORY_CONCURRENCY: "banana" }, deps)).toBe(1)
+  expect(err.join("\n")).toContain("AGENT_MEMORY_CONCURRENCY")
+})
+
+test("AGENT_MEMORY_CONCURRENCY=2 smoke: run still distills and prints the same summary shape", async () => {
+  const { dir, env, out, deps } = setup()
+  mkdirSync(join(dir, "transcripts", "proja"), { recursive: true })
+  writeFileSync(join(dir, "transcripts", "proja", "ses_1.md"), transcript)
+  const rc = await runCli(["run"], { ...env, AGENT_MEMORY_CONCURRENCY: "2" }, { ...deps, llm })
+  expect(rc).toBe(0)
+  expect(out.join("\n")).toContain("1 added")
+})
+
+test("commands other than run/reflect never parse AGENT_MEMORY_CONCURRENCY — a bogus value doesn't affect them", async () => {
+  const { dir, env, out, deps } = setup()
+  mkdirSync(join(dir, "transcripts", "proja"), { recursive: true })
+  writeFileSync(join(dir, "transcripts", "proja", "ses_1.md"), transcript)
+  await runCli(["run"], env, { ...deps, llm })
+  out.length = 0
+  const bogusEnv = { ...env, AGENT_MEMORY_CONCURRENCY: "banana" }
+  expect(await runCli(["stats"], bogusEnv, deps)).toBe(0)
+  expect(await runCli(["reindex"], bogusEnv, deps)).toBe(0)
+  expect(await runCli(["review"], bogusEnv, deps)).toBe(0)
+})
+
 test("AGENT_MEMORY_TRIAGE=heuristic + AGENT_MEMORY_EXTRACT_RUNS=1 + AGENT_MEMORY_JUDGES=0 pin legacy single-pass behavior end to end via the CLI", async () => {
   const { dir, env, out, deps } = setup()
   mkdirSync(join(dir, "transcripts", "proja"), { recursive: true })

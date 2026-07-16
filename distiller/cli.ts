@@ -3,6 +3,7 @@ import { join } from "node:path"
 import { loadConfig } from "../shared/config"
 import { probeSqlite } from "../shared/sqliteProbe"
 import { clientFromEnv, type LlmClient } from "./llm"
+import { withConcurrencyLimit } from "./limiter"
 import { openMemoryIndex, type MemoryQuery } from "./indexes"
 import { runPipeline } from "./pipeline"
 import { runReflect } from "./reflect"
@@ -60,14 +61,15 @@ export async function runCli(
         const triage = triageEnv(env, "AGENT_MEMORY_TRIAGE", "llm")
         const extractRuns = numEnv(env, "AGENT_MEMORY_EXTRACT_RUNS", 2, (n) => Number.isInteger(n) && n >= 1 && n <= 5)
         const judges = numEnv(env, "AGENT_MEMORY_JUDGES", 3, (n) => Number.isInteger(n) && n >= 0 && n <= 5)
+        const concurrency = numEnv(env, "AGENT_MEMORY_CONCURRENCY", 8, (n) => Number.isInteger(n) && n >= 1 && n <= 32)
         const pi = rest.indexOf("--project")
         const project = pi >= 0 ? rest[pi + 1] : undefined
         if (pi >= 0 && !project) throw new Error("--project needs a value")
-        const llm = deps.llm ?? clientFromEnv(env)
+        const llm = withConcurrencyLimit(deps.llm ?? clientFromEnv(env), concurrency)
         mkdirSync(cfg.storeDir, { recursive: true })
         const index = await openIndex(cfg, env, err)
         try {
-          const s = await runPipeline(cfg, { llm, index }, { project, idleHours, salienceMin, triage, extractRuns, judges })
+          const s = await runPipeline(cfg, { llm, index }, { project, idleHours, salienceMin, triage, extractRuns, judges, concurrency })
           out(
             `distill done: ${s.ops.added} added, ${s.ops.updated} updated, ${s.ops.superseded} superseded, ` +
               `${s.ops.nooped} nooped, ${s.quarantined} quarantined, ${s.rejected} rejected, ${s.errors} errors ` +
@@ -82,6 +84,7 @@ export async function runCli(
       case "reflect": {
         const salienceMin = numEnv(env, "AGENT_MEMORY_SALIENCE_MIN", 6, (n) => n >= 0 && n <= 10)
         const judges = numEnv(env, "AGENT_MEMORY_JUDGES", 3, (n) => Number.isInteger(n) && n >= 0 && n <= 5)
+        const concurrency = numEnv(env, "AGENT_MEMORY_CONCURRENCY", 8, (n) => Number.isInteger(n) && n >= 1 && n <= 32)
         let project: string | undefined
         let dryRun = false
         for (let i = 0; i < rest.length; i++) {
@@ -96,7 +99,7 @@ export async function runCli(
             throw new Error(`reflect: unknown flag "${flag}"`)
           }
         }
-        const llm = deps.llm ?? clientFromEnv(env)
+        const llm = withConcurrencyLimit(deps.llm ?? clientFromEnv(env), concurrency)
         mkdirSync(cfg.storeDir, { recursive: true })
         const index = await openIndex(cfg, env, err)
         try {

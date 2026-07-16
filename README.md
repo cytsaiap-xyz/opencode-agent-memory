@@ -288,6 +288,50 @@ in legacy mode. Budget accordingly for nightly cron/launchd runs (see
 Scheduling below) and prefer a self-hosted vLLM backend for production
 volume.
 
+### Parallel processing
+
+The pipeline runs each eligible transcript through a **two-phase architecture**:
+
+```
+Phase A (bounded, concurrent, per transcript)     Phase B (strictly sequential)
+┌─────────────────────────────────────────┐        ┌──────────────────────────┐
+│ TRIAGE → EXTRACT×N → VALIDATE →          │  ───▶  │ per transcript, in       │
+│ POOL-DEDUP → JUDGE                       │        │ original scan order:     │
+│ (zero store/index/ledger writes)         │        │ RECONCILE → COMMIT       │
+└─────────────────────────────────────────┘        └──────────────────────────┘
+```
+
+Phase A does all the LLM-heavy work (triage, N extraction runs, judge panel)
+for every dispatched transcript concurrently, bounded by a semaphore
+(`PipelineOptions.concurrency`) — but it never writes to `store/`, the
+sqlite index, or the ledger. Phase B then walks the prepared results back in
+the transcripts' original order (not completion order) and does all writes —
+`writeQuarantineEntry`, `reconcileCandidate`, `recordProcessed` — strictly
+one at a time. This **single-writer commit guarantee** is what keeps the
+store deterministic: running the same spool at concurrency 1 or concurrency
+32 produces a byte-identical `store/` tree and an equal ledger row set (see
+the equivalence test in `distiller/pipeline.test.ts`), because commit order
+never depends on which transcript's LLM calls happen to finish first.
+
+Separately, `AGENT_MEMORY_CONCURRENCY` (default `8`, integer `[1, 32]`) caps
+the number of **in-flight LLM calls** across the whole process — the CLI
+wraps whichever `LlmClient` it builds (`vllm` or `opencode-run`) in a FIFO
+semaphore decorator (`distiller/limiter.ts: withConcurrencyLimit`) before
+handing it to `runPipeline`/`runReflect`, so the cap applies uniformly no
+matter how many transcripts or judge panels are firing calls concurrently.
+This is a different knob from `PipelineOptions.concurrency` above (that one
+bounds transcript-level fan-out; this one bounds total concurrent HTTP/
+process calls to the LLM backend) — in practice they're set to the same
+value from the CLI, but they answer different questions.
+
+**Tuning `AGENT_MEMORY_CONCURRENCY`:** the default of `8` is aimed at a
+self-hosted vLLM backend, which can genuinely serve 8 concurrent requests
+and is the whole point of parallelizing. The `opencode-run` dev backend is
+different: each `complete()` call spawns a fresh `opencode run` subprocess,
+so cranking concurrency up mostly just contends for CPU/memory across many
+processes rather than speeding anything up — `AGENT_MEMORY_CONCURRENCY=2` is
+the recommended setting when running against `opencode-run`.
+
 ### CLI usage
 
 ```bash
@@ -532,6 +576,7 @@ introducing its own knobs.
 | `AGENT_MEMORY_TRIAGE` | `llm` | `llm` \| `heuristic` — see "Extraction quality pack" below. |
 | `AGENT_MEMORY_EXTRACT_RUNS` | `2` | Integer `[1, 5]` — self-consistency extraction runs per transcript, see below. |
 | `AGENT_MEMORY_JUDGES` | `3` | Integer `[0, 5]` — judge panel size for salience consensus, see below. `0` or `1` disables. |
+| `AGENT_MEMORY_CONCURRENCY` | `8` | Integer `[1, 32]` — global cap on in-flight LLM calls (`distill run` and `distill reflect` both wrap their LLM client in this limiter), see "Parallel processing" below. |
 
 `AGENT_MEMORY_HOME` (see the collector's Configuration table above) is shared
 — it also determines `store/` and `transcripts/` for the distiller.
